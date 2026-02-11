@@ -6,14 +6,16 @@ import matplotlib.pyplot as plt
 
 # Load the processed dataset
 try:
-    df = pd.read_csv('data/processed_dataset.csv')
+    df = pd.read_csv('/workspaces/Buying-vs.-Renting-a-Property-in-Toronto/data/processed_data.csv')
 except FileNotFoundError:
     print("Error: 'data/processed_dataset.csv' not found.")
-    print("Please run the preprocessing and feature engineering scripts first.")
     exit()
 
+df_numeric = df.select_dtypes(include=['number'])
+
+
 # Calculate the correlation matrix
-correlation_matrix = df.corr()
+correlation_matrix = df_numeric.corr()
 
 # Plot the correlation matrix as a heatmap
 plt.figure(figsize=(16, 12))
