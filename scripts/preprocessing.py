@@ -53,8 +53,13 @@ for col in cols_to_smooth:
     else:
         print(f"Warning: Column '{col}' not found in dataframe.")
 
-#modifying features to allow for XGB to best use them
-df['Log_Price'] = np.log(df['market_price_target_average,_detached_single_family_homes'])
+# Target: Month-over-Month Log Return (change in log price)
+# Compute directly without creating a persistent `Log_Price` column
+price_col = 'market_price_target_average,_detached_single_family_homes'
+if price_col in df.columns:
+    df['Log_Return_MoM'] = np.log(df[price_col]).diff()
+else:
+    df['Log_Return_MoM'] = 0.0
 
 df['GDP_Growth_YoY'] = df['national_gdp_real,_seasonally_adjusted'].pct_change(12)
 df['National_Pop_Growth_YoY'] = df['national_pop'].pct_change(12)
@@ -79,20 +84,30 @@ df['Affordability_Ratio_Lag1'] = df['Ratio_Current_1'].shift(1)
 df['Ratio_Current_12'] = df['market_price_target_average,_detached_single_family_homes'] / df['median_income_per_household_in_toronto']
 df['Affordability_Ratio_Lag12'] = df['Ratio_Current_12'].shift(12)
 
-#creating new feaetures for lags and deltas to provide more context for XBG model
+# --- 1. DEFINE TARGET VARIABLE (The Delta Strategy) ---
+# We predict the Month-over-Month Log Return (Change in Log Price)
+# diff() on a log variable = Log Return
+df['Log_Return_MoM'] = df['Log_Price'].diff()
+df['Log_Return_MoM'] = df['Log_Return_MoM'].fillna(0) # Handle first row NaN
 
-# We use a list to store all new series, then concat at the end to avoid fragmentation
+# --- 2. FEATURE ENGINEERING ---
 new_features = []
 
-# PRICE GROUP: market_price..., Log_Price (Lags: 1, 3, 6, 12 | Deltas: 1, 12 Pct)
-price_cols = ['market_price_target_average,_detached_single_family_homes', 'Log_Price']
-for col in [c for c in price_cols if c in df.columns]:
+# --- A. PRICE GROUP (Split to handle Log vs Real logic) ---
+# 1. Real Market Price (Use Pct Change)
+col = 'market_price_target_average,_detached_single_family_homes'
+if col in df.columns:
     for m in [1, 3, 6, 12]:
         new_features.append(df[col].shift(m).rename(f"{col}_lag_{m}"))
     for m in [1, 12]:
         new_features.append(df[col].pct_change(m).rename(f"{col}_delta_{m}m_pct"))
 
-# MACRO GROUP: GDP, Pop, Income, CPI (Lags: 12 | Deltas: 12 Pct)
+# 2. Log Price (Use Diff, NOT Pct Change) & Log Returns (Momentum)
+# MOMENTUM FEATURES (Lags of the Target Log Returns)
+for m in [1, 3, 6, 12]:
+    new_features.append(df['Log_Return_MoM'].shift(m).rename(f"Log_Return_MoM_lag_{m}"))
+
+# --- B. MACRO GROUP ---
 macro_cols = [
     'national_pop', 'provincial_pop', 'municipal_pop',
     'national_gdp_real,_seasonally_adjusted', 'provincial_gdp_real,_seasonally_adjusted',
@@ -102,7 +117,7 @@ for col in [c for c in macro_cols if c in df.columns]:
     new_features.append(df[col].shift(12).rename(f"{col}_lag_12"))
     new_features.append(df[col].pct_change(12).rename(f"{col}_delta_12m_pct"))
 
-# FINANCIALS GROUP: Mortgage Rates, Bonds (Lags: 1, 3 | Deltas: 1, 3 Diff)
+# --- C. FINANCIALS GROUP (Rates use Diff) ---
 fin_cols = [
     '3_month_t_bill', '2y_bond', '5y_bond', '10y_bond', 
     'variable_mortgage_rate', '5_year_fixed_mortgage_rate', 
@@ -113,7 +128,7 @@ for col in [c for c in fin_cols if c in df.columns]:
         new_features.append(df[col].shift(m).rename(f"{col}_lag_{m}"))
         new_features.append(df[col].diff(m).rename(f"{col}_delta_{m}m_diff"))
 
-# SUPPLY GROUP: Starts, Under Construction, Volume (Lags: 12 | Deltas: 12 Pct)
+# --- D. SUPPLY GROUP ---
 supply_cols = [
     'housing_starts_sfh,_monthly', 'under_construction_sfh,_monthly', 
     'completions__sfh,_monthly', 'sales_volume'
@@ -122,7 +137,7 @@ for col in [c for c in supply_cols if c in df.columns]:
     new_features.append(df[col].shift(12).rename(f"{col}_lag_12"))
     new_features.append(df[col].pct_change(12).rename(f"{col}_delta_12m_pct"))
 
-# MIGRATION GROUP: NPRs and International (Lags: 1, 12 | Deltas: 12 Pct)
+# --- E. MIGRATION GROUP ---
 migration_cols = [
     'ontario_net_international_migration_monthly', 
     'ontario_net_interprovincial_migration_monthly',
@@ -133,8 +148,16 @@ for col in [c for c in migration_cols if c in df.columns]:
         new_features.append(df[col].shift(m).rename(f"{col}_lag_{m}"))
     new_features.append(df[col].pct_change(12).rename(f"{col}_delta_12m_pct"))
 
-# Join all new columns to the original dataframe at once
+# --- 3. MERGE & CLEANUP ---
+# Concat all new features
 df = pd.concat([df] + new_features, axis=1)
+
+# CRITICAL: Replace Infinities from pct_change with 0
+# This prevents XGBoost from crashing later
+df.replace([np.inf, -np.inf], 0, inplace=True)
+
+# Optional: Fill NaNs created by lags with 0 or drop (Simulator usually handles drops, but filling 0 is safer for feature engineering)
+# df.fillna(0, inplace=True)
 
 # Define the list of columns to drop
 columns_to_drop = [
