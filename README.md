@@ -8,4 +8,4 @@ Motivation:
 Methods: 
 - XGBoost as Primary Predictor
 - ARIMAX + Harmonic + Random Noise as Column Extender for 'backbone' variables (e.g. population, GDP)
-- Conditional Functions as Column Extender for Dependant variables
+- ARIMAX as Column Extender for Dependant variables
