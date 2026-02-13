@@ -198,7 +198,7 @@ def audit_single_iteration():
     print(audit_df[head_cols].tail())
     
     # 8. SAVE TO CSV
-    output_path = 'data/simulation_audit_trace.csv'
+    output_path = 'results/simulation_audit_trace.csv'
     print(f"\n9. Saving full audit trace to {output_path}...")
     audit_df.to_csv(output_path)
     print(f"   ✓ Saved {len(audit_df)} rows × {len(audit_df.columns)} columns")
