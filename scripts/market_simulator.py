@@ -84,9 +84,9 @@ class MarketSimulator:
         # --- SENTIMENT & BIAS CONFIGURATION (Market Optimism Tuning) ---
         # Baseline + 20% optimism increase from neutral
         # Restores baseline, then adds subtle upward bias (0.1% monthly drift)
-        self.sentiment_shock_mean = 0.0008  # +0.1% monthly bias (subtle optimism)
+        self.sentiment_shock_mean = 0.0009  # +0.1% monthly bias (subtle optimism)
         self.sentiment_shock_std = 0.02  # Standard deviation of shocks (volatility of sentiment)
-        self.sentiment_mean_reversion = 0.952  # Slightly faster recovery (~0.7% annualized upward drift)
+        self.sentiment_mean_reversion = 0.958  # Slightly faster recovery (~0.7% annualized upward drift)
 
         # Explicit mapping: Growth Rate -> Absolute Level Column
         self.growth_to_level_map = {
@@ -216,7 +216,7 @@ class MarketSimulator:
         X = X.replace([np.inf, -np.inf], 0)
         
         if XGBRegressor:
-            self.xgb_model = XGBRegressor(n_estimators=200, random_state=self.seed, verbosity=0)
+            self.xgb_model = XGBRegressor(n_estimators=200, learning_rate=0.05, random_state=self.seed, verbosity=0)
             self.xgb_model.fit(X, y)
         
         print("Training Complete.")
