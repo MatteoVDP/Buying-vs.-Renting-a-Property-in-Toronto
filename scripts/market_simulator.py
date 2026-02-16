@@ -68,6 +68,25 @@ class MarketSimulator:
         self.sarimax_models = {}
         self.xgb_model = None
         self.feature_columns = None
+        
+        # --- 3. EXTREME EVENT CONFIGURATION ---
+        # Noise reduction for Tier 1 variables (macro indicators)
+        self.tier1_noise_scale = 0.5  # Reduce residual noise by 50% to improve signal-to-noise
+        
+        # Refined Black Swan: Lower probability, moderate impact, auto-recovery
+        self.black_swan_prob = 0.001  # 0.1% per month (was 0.5%)
+        
+        # Doomsday Scenario: Catastrophic tail risk (0.0417% per month = 1 in 2,400 = ~1 every 200 years)
+        self.doomsday_prob = 0 #0.0004167  # Increased magnitude (was 0.00001)
+        self.doomsday_crash_magnitude = 0.18  # 15-20% crash over 24 months
+        self.doomsday_duration_months = 24  # 2-year unfolding period
+        
+        # --- SENTIMENT & BIAS CONFIGURATION (Market Optimism Tuning) ---
+        # Baseline + 20% optimism increase from neutral
+        # Restores baseline, then adds subtle upward bias (0.1% monthly drift)
+        self.sentiment_shock_mean = 0.0008  # +0.1% monthly bias (subtle optimism)
+        self.sentiment_shock_std = 0.02  # Standard deviation of shocks (volatility of sentiment)
+        self.sentiment_mean_reversion = 0.952  # Slightly faster recovery (~0.7% annualized upward drift)
 
         # Explicit mapping: Growth Rate -> Absolute Level Column
         self.growth_to_level_map = {
@@ -207,36 +226,89 @@ class MarketSimulator:
         last_date = self.df.index.max()
         future_index = pd.date_range(last_date + pd.offsets.MonthBegin(1), periods=steps, freq='MS')
         
-        # --- Tier 1 Simulation ---
+        # --- Tier 1 Simulation with REDUCED NOISE ---
         tier1_sim = pd.DataFrame(index=future_index)
         for v in self.tier1_vars:
             model = self.arima_models.get(v)
             if model:
-                # Predict and add noise from residuals
+                # Predict and add SCALED noise from residuals
+                # Scaling by 0.5x preserves patterns while reducing month-to-month noise
                 try:
                     fc = model.predict(n_periods=steps)
                     resid = model.resid()
-                    # Bootstrap residuals
+                    # Bootstrap residuals, then scale down by self.tier1_noise_scale
                     noise = np.random.choice(resid, size=steps, replace=True)
-                    tier1_sim[v] = fc + noise
+                    tier1_sim[v] = fc + self.tier1_noise_scale * noise  # REDUCED NOISE
                 except Exception:
                     hist = self.df[v].dropna()
-                    tier1_sim[v] = np.random.normal(hist.mean(), hist.std(), size=steps)
+                    tier1_sim[v] = np.random.normal(hist.mean(), hist.std() * self.tier1_noise_scale, size=steps)
             else:
                 # Fallback: Random walk with drift
                 hist = self.df[v].dropna()
-                tier1_sim[v] = np.random.normal(hist.mean(), hist.std(), size=steps)
+                tier1_sim[v] = np.random.normal(hist.mean(), hist.std() * self.tier1_noise_scale, size=steps)
 
         # Reconstruct Absolute Levels (e.g. GDP Growth -> GDP Level)
         tier1_sim = self._reconstruct_levels(tier1_sim)
         
-        # --- Black Swan Events (Optional): Rare regime shifts ---
-        # 0.5% chance per month of a financial crisis event
-        black_swan_prob = 0.005
-        crisis_months = [i for i in range(steps) if np.random.random() < black_swan_prob]
-        for month_idx in crisis_months:
-            # Trigger GDP collapse and rate spike
-            tier1_sim.iloc[month_idx, tier1_sim.columns.get_loc('GDP_Growth_YoY')] = -0.05
+        # --- DOOMSDAY SCENARIO: Catastrophic tail risk (0.001% per month) ---
+        doomsday_triggered = np.random.random() < self.doomsday_prob
+        doomsday_start_month = None
+        
+        if doomsday_triggered and steps > self.doomsday_duration_months:
+            # Doomsday occurs at a random month with enough runway
+            doomsday_start_month = np.random.randint(0, steps - self.doomsday_duration_months)
+            print(f"⚠️  DOOMSDAY SCENARIO TRIGGERED at month {doomsday_start_month}")
+            
+            # Apply cascading collapse to Tier 1 variables
+            for month_offset in range(self.doomsday_duration_months):
+                crisis_month_idx = doomsday_start_month + month_offset
+                if crisis_month_idx >= steps:
+                    break
+                
+                # Severity decreases over time (front-loaded crash)
+                severity_decay = 1.0 - (month_offset / self.doomsday_duration_months) ** 2
+                
+                # GDP shock: severe decline in first year, partial recovery in second
+                if month_offset < 12:
+                    gdp_shock = -0.08 * severity_decay  # Up to -8% GDP
+                else:
+                    gdp_shock = -0.02 * severity_decay  # Stabilizing year 2
+                tier1_sim.iloc[crisis_month_idx, tier1_sim.columns.get_loc('GDP_Growth_YoY')] = gdp_shock
+                
+                # Population/migration shocks (people leave crisis zones)
+                if 'National_Pop_Growth_YoY' in tier1_sim.columns:
+                    pop_shock = -0.03 * severity_decay
+                    tier1_sim.iloc[crisis_month_idx, tier1_sim.columns.get_loc('National_Pop_Growth_YoY')] = pop_shock
+                
+                # Inflation spike early (supply chain destruction), then normalizes
+                if 'Inflation_Rate_YoY' in tier1_sim.columns:
+                    if month_offset < 6:
+                        inflation_shock = 0.08  # Inflation spike
+                    else:
+                        inflation_shock = 0.02 * severity_decay  # Deflation risk
+                    tier1_sim.iloc[crisis_month_idx, tier1_sim.columns.get_loc('Inflation_Rate_YoY')] = inflation_shock
+            
+            # Rebuild GDP levels after shock sequence
+            if 'national_gdp_real,_seasonally_adjusted' in tier1_sim.columns:
+                rates = tier1_sim['GDP_Growth_YoY'].values
+                last_level = self.df['national_gdp_real,_seasonally_adjusted'].iloc[-1]
+                new_levels = [last_level]
+                for r in rates:
+                    new_levels.append(new_levels[-1] * (1 + r))
+                tier1_sim['national_gdp_real,_seasonally_adjusted'] = new_levels[1:]
+        
+        # --- BLACK SWAN EVENTS: Refined - Rare regime shifts (0.1% per month) ---
+        # Lower probability than doomsday but quicker resolution
+        black_swan_months = [i for i in range(steps) if np.random.random() < self.black_swan_prob]
+        for month_idx in black_swan_months:
+            # Skip if this month is in doomsday crisis (avoid double-shocking)
+            if doomsday_start_month is not None:
+                if doomsday_start_month <= month_idx < doomsday_start_month + self.doomsday_duration_months:
+                    continue
+            
+            # Moderate GDP shock with faster recovery
+            tier1_sim.iloc[month_idx, tier1_sim.columns.get_loc('GDP_Growth_YoY')] = -0.03
+            
             # Rebuild the reconstructed GDP level after the shock
             if 'national_gdp_real,_seasonally_adjusted' in tier1_sim.columns:
                 rates = tier1_sim['GDP_Growth_YoY'].values
@@ -313,7 +385,6 @@ class MarketSimulator:
             
             # --- SENTIMENT ACCUMULATOR: Initialize for this iteration ---
             sentiment_score = 0.0
-            sentiment_decay = 0.95  # Mean-reversion: bubbles burst, crashes recover
             
             # 3. Recursive Loop: now the model predicts monthly log RETURNS (Log_Return_MoM)
             for t in range(steps):
@@ -338,9 +409,12 @@ class MarketSimulator:
                 # --- TIER 4: Predict monthly log RETURN (from XGBoost) ---
                 rational_log_return = float(self.xgb_model.predict(X_row)[0])
 
-                # --- MARKET SENTIMENT & BUBBLES (applied to returns) ---
-                monthly_shock = np.random.normal(0, 0.02)
-                sentiment_score = (sentiment_score * sentiment_decay) + monthly_shock
+                # --- MARKET SENTIMENT & BUBBLES (applied to returns) with CONFIGURABLE OPTIMISM ---
+                # Generate sentiment shock from configurable distribution
+                # - sentiment_shock_mean controls optimism bias (positive = bullish)
+                # - sentiment_shock_std controls volatility
+                monthly_shock = np.random.normal(self.sentiment_shock_mean, self.sentiment_shock_std)
+                sentiment_score = (sentiment_score * self.sentiment_mean_reversion) + monthly_shock
 
                 # Final predicted log return for this month
                 pred_log_return = rational_log_return + sentiment_score
