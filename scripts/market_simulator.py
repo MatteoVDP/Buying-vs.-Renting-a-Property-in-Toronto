@@ -21,7 +21,7 @@ class MarketSimulator:
     Fixes applied: Infinity handling, Target Leakage prevention, Explicit Level Reconstruction.
     """
 
-    def __init__(self, df: pd.DataFrame, seed: int = 42, start_market_price: float = 1090326.0):
+    def __init__(self, df: pd.DataFrame, seed: int = 42, start_market_price: float = 1090326.0, xgb_n_estimators: int = 200, xgb_learning_rate: float = 0.05):
         self.df = df.copy()
         
         # --- 1. DATA PREP: Force Date Index & Frequency ---
@@ -36,6 +36,10 @@ class MarketSimulator:
 
         self.seed = seed
         np.random.seed(self.seed)
+        
+        # --- XGBoost Hyperparameters ---
+        self.xgb_n_estimators = xgb_n_estimators
+        self.xgb_learning_rate = xgb_learning_rate
 
         # --- 2. VARIABLE DEFINITIONS ---
         self.tier1_vars = [
@@ -84,9 +88,10 @@ class MarketSimulator:
         # --- SENTIMENT & BIAS CONFIGURATION (Market Optimism Tuning) ---
         # Baseline + 20% optimism increase from neutral
         # Restores baseline, then adds subtle upward bias (0.1% monthly drift)
-        self.sentiment_shock_mean = 0.0009  # +0.1% monthly bias (subtle optimism)
-        self.sentiment_shock_std = 0.02  # Standard deviation of shocks (volatility of sentiment)
-        self.sentiment_mean_reversion = 0.958  # Slightly faster recovery (~0.7% annualized upward drift)
+        # The "Steady Real Estate" Configuration
+        self.sentiment_shock_mean = 0#.00001    # +0.1% monthly bias (~1.2% annualized upward drift)
+        self.sentiment_shock_std = 0#.004     # 0.4% monthly volatility (smooths out the erratic bouncing)
+        self.sentiment_mean_reversion = 0#.25 # Shocks fade out quickly (prevents 10-year death spirals)
 
         # Explicit mapping: Growth Rate -> Absolute Level Column
         self.growth_to_level_map = {
@@ -133,7 +138,7 @@ class MarketSimulator:
                 endog = train_df[v].dropna()
                 exog = exog_tier1.loc[endog.index]
                 mod = SARIMAX(endog, exog=exog, order=(1, 1, 1), enforce_stationarity=False)
-                self.sarimax_models[v] = mod.fit(disp=False)
+                self.sarimax_models[v] = mod.fit(disp=False, maxiter=150)
             except Exception:
                 self.sarimax_models[v] = None
 
@@ -146,7 +151,7 @@ class MarketSimulator:
                 endog = train_df[v].dropna()
                 exog = exog_tier1_2.loc[endog.index]
                 mod = SARIMAX(endog, exog=exog, order=(1, 1, 1), enforce_stationarity=False)
-                self.sarimax_models[v] = mod.fit(disp=False)
+                self.sarimax_models[v] = mod.fit(disp=False, maxiter=150)
             except Exception:
                 self.sarimax_models[v] = None
 
@@ -216,7 +221,7 @@ class MarketSimulator:
         X = X.replace([np.inf, -np.inf], 0)
         
         if XGBRegressor:
-            self.xgb_model = XGBRegressor(n_estimators=200, learning_rate=0.05, random_state=self.seed, verbosity=0)
+            self.xgb_model = XGBRegressor(n_estimators=self.xgb_n_estimators, learning_rate=self.xgb_learning_rate, n_jobs=-1, random_state=self.seed, verbosity=0)
             self.xgb_model.fit(X, y)
         
         print("Training Complete.")
