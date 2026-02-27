@@ -1,0 +1,4 @@
+Data loaded:  675 rows
+MarketSimulator imported successfully
+Simulator initialized
+Feature columns will be: 96

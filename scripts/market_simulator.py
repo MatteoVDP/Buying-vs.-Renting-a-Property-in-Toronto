@@ -42,23 +42,41 @@ class MarketSimulator:
         self.xgb_learning_rate = xgb_learning_rate
 
         # --- 2. VARIABLE DEFINITIONS ---
+        # --- TIER 1: The Independent Macro Foundation (Modeled via ARIMA) ---
+        # These variables are driven by federal policy or global macro forces.
         self.tier1_vars = [
-            'GDP_Growth_YoY', 'National_Pop_Growth_YoY', 
-            'Provincial_Pop_Growth_YoY', 'Municipal_Pop_Growth_YoY', 
-            'Inflation_Rate_YoY'
+            'GDP_Growth_YoY', 
+            'most_recent_quarterly_gdp_%_change_extended',
+            'Inflation_Rate_YoY',
+            'Inflation_Rate_MoM',
+            'National_Pop_Growth_YoY', 
+            'Municipal_Pop_Growth_YoY', 
+            'Migration_Rate', 
+            'NPR_Rate'
         ]
 
+        # --- TIER 2: The Financial & Labor Engine (Modeled via SARIMAX, Exog = Tier 1) ---
+        # The bond market and labor market react to GDP and Inflation.
         self.tier2_vars = [
-            'variable_mortgage_rate', '5_year_fixed_mortgage_rate',
-            '5_year_fixed_mortgage_qualifying_rate', '3_month_t_bill',
-            '2y_bond', '5y_bond', '10y_bond', 'yield_curve_slope',
-            'labour_force_participation_rate', 'total_employment_rate',
-            'Income_Growth_YoY', 'national_debt_to_gdp'
+            '3_month_t_bill', 
+            '5y_bond', 
+            'yield_curve_slope',
+            'variable_mortgage_rate', 
+            '5_year_fixed_mortgage_qualifying_rate',
+            'labour_force_participation_rate', 
+            'total_employment_rate',
+            'Income_Growth_YoY', 
+            'national_debt_to_gdp',
+            'provincial_debt_to_gdp',
+            'Labour_Force_Growth_YoY',
         ]
 
+        # --- TIER 3: The Physical Housing Supply (Modeled via SARIMAX, Exog = Tier 1 + 2) ---
+        # Builders decide to pour concrete based on Population (Tier 1) and Borrowing Costs (Tier 2).
         self.tier3_vars = [
-            'housing_starts_per_cap', 'under_construction_per_cap',
-            'completions_per_cap', 'Migration_Rate', 'NPR_Rate'
+            'housing_starts_per_cap', 
+            'under_construction_per_cap',
+            'completions_per_cap'
         ]
 
         # Target variable is monthly log return (changed in processed_data)
@@ -75,7 +93,7 @@ class MarketSimulator:
         
         # --- 3. EXTREME EVENT CONFIGURATION ---
         # Noise reduction for Tier 1 variables (macro indicators)
-        self.tier1_noise_scale = 0.5  # Reduce residual noise by 50% to improve signal-to-noise
+        self.tier1_noise_scale = 0.25 
         
         # Refined Black Swan: Lower probability, moderate impact, auto-recovery
         self.black_swan_prob = 0.001  # 0.1% per month (was 0.5%)
@@ -89,145 +107,160 @@ class MarketSimulator:
         # Baseline + 20% optimism increase from neutral
         # Restores baseline, then adds subtle upward bias (0.1% monthly drift)
         # The "Steady Real Estate" Configuration
-        self.sentiment_shock_mean = 0#.00001    # +0.1% monthly bias (~1.2% annualized upward drift)
-        self.sentiment_shock_std = 0#.004     # 0.4% monthly volatility (smooths out the erratic bouncing)
-        self.sentiment_mean_reversion = 0#.25 # Shocks fade out quickly (prevents 10-year death spirals)
-
-        # Explicit mapping: Growth Rate -> Absolute Level Column
-        self.growth_to_level_map = {
-            'GDP_Growth_YoY': 'national_gdp_real,_seasonally_adjusted',
-            'National_Pop_Growth_YoY': 'national_pop',
-            'Provincial_Pop_Growth_YoY': 'provincial_pop',
-            'Municipal_Pop_Growth_YoY': 'municipal_pop',
-            'Income_Growth_YoY': 'median_income_per_household_in_toronto',
-            'Inflation_Rate_YoY': 'cpi___national,_all_products',
-        }
+        self.sentiment_shock_mean = 0.001    # +0.1% monthly bias (~1.2% annualized upward drift)
+        self.sentiment_shock_std = 0.004     # 0.4% monthly volatility (smooths out the erratic bouncing)
+        self.sentiment_mean_reversion = 0.25 # Shocks fade out quickly (prevents 10-year death spirals)
 
     def fit(self, train_df: pd.DataFrame = None):
-        """Fit all models (Tier 1 -> Tier 4)."""
+        """Fit all tiers: ARIMA (Tier 1), SARIMAX (Tier 2/3), XGBoost (Tier 4)."""
         if train_df is None:
             train_df = self.df.copy()
 
+        # Variables that have strong seasonal patterns and need seasonal ARIMA
+        seasonal_variables = {
+            'Migration_Rate', 'NPR_Rate',  # Tier 1
+            'labour_force_participation_rate', 'total_employment_rate',  # Tier 2
+            'housing_starts_per_cap', 'under_construction_per_cap', 'completions_per_cap'  # Tier 3
+        }
+
+        # --- Tier 1: ARIMA for independent macro variables ---
         print("Fitting Tier 1 (ARIMA)...")
+        tier1_success = 0
+        tier1_failed = []
         for v in self.tier1_vars:
             if v not in train_df.columns: 
+                tier1_failed.append(f"{v} (not in data)")
                 continue
             series = train_df[v].dropna()
             # Safety check for data length
             if len(series) < 24 or pm is None:
                 self.arima_models[v] = None
+                tier1_failed.append(f"{v} (insufficient data: {len(series)} rows)")
                 continue
             
             try:
-                model = pm.auto_arima(series, seasonal=True, m=12, 
-                                      error_action='ignore', suppress_warnings=True, 
-                                      stepwise=True, max_p=2, max_q=2)
+                # Use seasonal ARIMA only for variables with strong seasonality
+                use_seasonal = v in seasonal_variables
+                if use_seasonal:
+                    model = pm.auto_arima(series, seasonal=True, m=12,
+                                          error_action='ignore', suppress_warnings=True, 
+                                          stepwise=True, max_p=2, max_q=2, max_P=1, max_Q=1,
+                                          trace=False, n_jobs=-1)
+                else:
+                    model = pm.auto_arima(series, seasonal=False,
+                                          error_action='ignore', suppress_warnings=True, 
+                                          stepwise=True, max_p=2, max_q=2, max_d=1,
+                                          trace=False, n_jobs=-1)
                 self.arima_models[v] = model
-            except Exception:
+                tier1_success += 1
+                seasonal_str = "(seasonal)" if use_seasonal else ""
+                print(f"    ✓ {v} {seasonal_str}")
+            except Exception as e:
                 self.arima_models[v] = None
-
-        print("Fitting Tier 2 & 3 (SARIMAX)...")
-        # Prepare exogenous data (Tier 1)
-        exog_tier1 = train_df[self.tier1_vars].ffill().fillna(0)
+                tier1_failed.append(f"{v} ({str(e)[:50]})")
         
-        # Fit Tier 2
+        print(f"  ✓ Tier 1: {tier1_success}/{len(self.tier1_vars)} models fitted successfully")
+        if tier1_failed:
+            print(f"  ✗ Failed: {', '.join(tier1_failed)}")
+
+        # --- Tier 2 & 3: SARIMAX with exogenous variables ---
+        print("Fitting Tier 2 & 3 (SARIMAX)...")
+        # Prepare exogenous data (Tier 1) - only use variables that exist and were fitted
+        available_tier1_vars = [v for v in self.tier1_vars if v in train_df.columns and self.arima_models.get(v) is not None]
+        if not available_tier1_vars:
+            print("  ⚠️  No Tier 1 variables available for Tier 2/3 SARIMAX models")
+            available_tier1_vars = [v for v in self.tier1_vars if v in train_df.columns]
+        
+        exog_tier1 = train_df[available_tier1_vars].ffill().fillna(0)
+        
+        # Fit Tier 2 (Financial & Labor variables with Tier 1 as exog)
+        tier2_success = 0
+        tier2_failed = []
         for v in self.tier2_vars:
             if v not in train_df.columns: 
+                tier2_failed.append(f"{v} (not in data)")
                 continue
             try:
                 endog = train_df[v].dropna()
                 exog = exog_tier1.loc[endog.index]
-                mod = SARIMAX(endog, exog=exog, order=(1, 1, 1), enforce_stationarity=False)
+                # Use seasonal SARIMAX for variables with strong seasonality
+                use_seasonal = v in seasonal_variables
+                if use_seasonal:
+                    mod = SARIMAX(endog, exog=exog, order=(1, 1, 1), seasonal_order=(1, 0, 1, 12), enforce_stationarity=False)
+                else:
+                    mod = SARIMAX(endog, exog=exog, order=(1, 1, 1), enforce_stationarity=False)
                 self.sarimax_models[v] = mod.fit(disp=False, maxiter=150)
-            except Exception:
+                tier2_success += 1
+            except Exception as e:
                 self.sarimax_models[v] = None
+                tier2_failed.append(f"{v} ({str(e)[:50]})")
+        
+        print(f"  ✓ Tier 2: {tier2_success}/{len(self.tier2_vars)} models fitted successfully")
+        if tier2_failed:
+            print(f"  ✗ Failed: {', '.join(tier2_failed)}")
 
-        # Fit Tier 3 (Exog = Tier 1 + Tier 2)
-        exog_tier1_2 = pd.concat([train_df[self.tier1_vars], train_df[self.tier2_vars]], axis=1).ffill().fillna(0)
+        # Fit Tier 3 (Housing Supply with Tier 1 + Tier 2 as exog)
+        available_tier2_vars = [v for v in self.tier2_vars if v in train_df.columns]
+        exog_tier1_2 = pd.concat([train_df[available_tier1_vars], train_df[available_tier2_vars]], axis=1).ffill().fillna(0)
+        tier3_success = 0
+        tier3_failed = []
         for v in self.tier3_vars:
             if v not in train_df.columns: 
+                tier3_failed.append(f"{v} (not in data)")
                 continue
             try:
                 endog = train_df[v].dropna()
                 exog = exog_tier1_2.loc[endog.index]
-                mod = SARIMAX(endog, exog=exog, order=(1, 1, 1), enforce_stationarity=False)
+                # Use seasonal SARIMAX for variables with strong seasonality
+                use_seasonal = v in seasonal_variables
+                if use_seasonal:
+                    mod = SARIMAX(endog, exog=exog, order=(1, 1, 1), seasonal_order=(1, 0, 1, 12), enforce_stationarity=False)
+                else:
+                    mod = SARIMAX(endog, exog=exog, order=(1, 1, 1), enforce_stationarity=False)
                 self.sarimax_models[v] = mod.fit(disp=False, maxiter=150)
-            except Exception:
+                tier3_success += 1
+            except Exception as e:
                 self.sarimax_models[v] = None
+                tier3_failed.append(f"{v} ({str(e)[:50]})")
+        
+        print(f"  ✓ Tier 3: {tier3_success}/{len(self.tier3_vars)} models fitted successfully")
+        if tier3_failed:
+            print(f"  ✗ Failed: {', '.join(tier3_failed)}")
+        
+        # Store available variables for simulation
+        self.available_tier1_vars = available_tier1_vars
+        self.available_tier2_vars = available_tier2_vars
 
+        # --- Tier 4: XGBoost with simplified feature selection ---
         print("Fitting Tier 4 (XGBoost)...")
-        # Feature Engineering on History
-        hist = train_df.copy()
-        hist = self._update_lags_and_deltas(hist)
+        
+        # Use all columns from processed_data EXCEPT the target
+        exclude_cols = {self.price_col}  # Only exclude Log_Return_MoM (target)
+        feature_cols = [c for c in train_df.columns if c not in exclude_cols]
         
         # Drop rows where target is NaN
-        feature_df = hist.dropna(subset=[self.price_col])
-
-        # Select Features: Lags, Deltas (BUT NOT current target delta)
-        candidate_cols = [c for c in feature_df.columns if (
-            c.endswith('_lag_1') or c.endswith('_lag_12') or 
-            c.endswith('_delta_1m_pct') or c.endswith('_delta_12m_pct')
-        )]
-
-        # --- CRITICAL FIX: LEAKAGE PREVENTION ---
-        # We cannot use the CURRENT month's price delta to predict the current month's price.
-        # We can only use LAGGED price deltas.
-        forbidden_cols = [f'{self.price_col}_delta_1m_pct', f'{self.price_col}_delta_12m_pct']
+        feature_df = train_df.dropna(subset=[self.price_col])
         
-        # --- FEATURE REALIZABILITY CHECK ---
-        # Exclude columns from preprocessing that were dropped (won't exist in simulation).
-        dropped_bases = {
-            'market_price_target_average,_detached_single_family_homes',
-            'Log_Price',
-            'national_pop', 'provincial_pop', 'municipal_pop',
-            'national_gdp_real,_seasonally_adjusted',
-            'provincial_gdp_real,_seasonally_adjusted',
-            'median_income_per_household_in_toronto',
-            'cpi___national,_all_products', 'cpi___national,_core',
-            'housing_starts_sfh,_monthly', 'under_construction_sfh,_monthly',
-            'completions__sfh,_monthly', 'sales_volume',
-            'ontario_net_international_migration_monthly',
-            'ontario_net_interprovincial_migration_monthly',
-            'ontario_net_non_permanent_residents',
-        }
-        
-        realizable_cols = []
-        for c in candidate_cols:
-            if c in forbidden_cols:
-                continue
-            # Skip Log_Price features - it's not a simulation variable
-            if 'Log_Price' in c:
-                continue
-            # Extract base name (before _lag_ or _delta_)
-            base = None
-            for suffix in ['_lag_1', '_lag_12', '_delta_1m_pct', '_delta_12m_pct']:
-                if c.endswith(suffix):
-                    base = c[:-len(suffix)]
-                    break
-            if base and base in dropped_bases:
-                continue
-            realizable_cols.append(c)
-        
-        self.feature_columns = realizable_cols if realizable_cols else candidate_cols
-
-        if not self.feature_columns:
-            raise ValueError("No valid feature columns found for XGBoost.")
-
-        X = feature_df[self.feature_columns].fillna(0)
+        # Extract features and target
+        X = feature_df[feature_cols].fillna(0)
         y = feature_df[self.price_col]
-
-        # --- CRITICAL FIX: INFINITY HANDLING ---
-        # Replace Infs with 0 or NaN, then drop
+        
+        # Handle infinities
         X = X.replace([np.inf, -np.inf], 0)
         
+        self.feature_columns = feature_cols
+        
+        print(f"  XGBoost: {len(feature_cols)} features, {len(X)} samples")
+        
         if XGBRegressor:
-            self.xgb_model = XGBRegressor(n_estimators=self.xgb_n_estimators, learning_rate=self.xgb_learning_rate, n_jobs=-1, random_state=self.seed, verbosity=0)
+            self.xgb_model = XGBRegressor(n_estimators=self.xgb_n_estimators, learning_rate=self.xgb_learning_rate, max_depth=3, 
+            subsample=0.7, colsample_bytree=0.7,n_jobs=-1, random_state=self.seed, verbosity=0)
             self.xgb_model.fit(X, y)
         
         print("Training Complete.")
 
     def simulate_exogenous(self, steps: int = 300):
-        """Simulate Tier 1, 2, 3 and reconstruct levels with idiosyncratic shocks."""
+        """Simulate Tier 1, 2, 3 exogenous variables with idiosyncratic shocks and extreme events."""
         last_date = self.df.index.max()
         future_index = pd.date_range(last_date + pd.offsets.MonthBegin(1), periods=steps, freq='MS')
         
@@ -251,9 +284,6 @@ class MarketSimulator:
                 # Fallback: Random walk with drift
                 hist = self.df[v].dropna()
                 tier1_sim[v] = np.random.normal(hist.mean(), hist.std() * self.tier1_noise_scale, size=steps)
-
-        # Reconstruct Absolute Levels (e.g. GDP Growth -> GDP Level)
-        tier1_sim = self._reconstruct_levels(tier1_sim)
         
         # --- DOOMSDAY SCENARIO: Catastrophic tail risk (0.001% per month) ---
         doomsday_triggered = np.random.random() < self.doomsday_prob
@@ -293,14 +323,7 @@ class MarketSimulator:
                         inflation_shock = 0.02 * severity_decay  # Deflation risk
                     tier1_sim.iloc[crisis_month_idx, tier1_sim.columns.get_loc('Inflation_Rate_YoY')] = inflation_shock
             
-            # Rebuild GDP levels after shock sequence
-            if 'national_gdp_real,_seasonally_adjusted' in tier1_sim.columns:
-                rates = tier1_sim['GDP_Growth_YoY'].values
-                last_level = self.df['national_gdp_real,_seasonally_adjusted'].iloc[-1]
-                new_levels = [last_level]
-                for r in rates:
-                    new_levels.append(new_levels[-1] * (1 + r))
-                tier1_sim['national_gdp_real,_seasonally_adjusted'] = new_levels[1:]
+
         
         # --- BLACK SWAN EVENTS: Refined - Rare regime shifts (0.1% per month) ---
         # Lower probability than doomsday but quicker resolution
@@ -314,19 +337,15 @@ class MarketSimulator:
             # Moderate GDP shock with faster recovery
             tier1_sim.iloc[month_idx, tier1_sim.columns.get_loc('GDP_Growth_YoY')] = -0.03
             
-            # Rebuild the reconstructed GDP level after the shock
-            if 'national_gdp_real,_seasonally_adjusted' in tier1_sim.columns:
-                rates = tier1_sim['GDP_Growth_YoY'].values
-                last_level = self.df['national_gdp_real,_seasonally_adjusted'].iloc[-1]
-                new_levels = [last_level]
-                for r in rates:
-                    new_levels.append(new_levels[-1] * (1 + r))
-                tier1_sim['national_gdp_real,_seasonally_adjusted'] = new_levels[1:]
+
 
         # --- Tier 2 Simulation with IDIOSYNCRATIC SHOCKS ---
         tier2_sim = pd.DataFrame(index=future_index)
-        exog_tier1 = tier1_sim[self.tier1_vars].fillna(0)
+        # Use only variables that were available during fitting
+        available_tier1 = getattr(self, 'available_tier1_vars', [v for v in self.tier1_vars if v in tier1_sim.columns])
+        exog_tier1 = tier1_sim[available_tier1].fillna(0)
         
+        tier2_forecast_failures = []
         for v in self.tier2_vars:
             model = self.sarimax_models.get(v)
             if model:
@@ -336,19 +355,33 @@ class MarketSimulator:
                     # --- CRITICAL: INJECT INDEPENDENT IDIOSYNCRATIC SHOCKS ---
                     # Add volatility independent of Tier 1 (policy errors, supply shocks)
                     volatility = np.sqrt(model.mse) if hasattr(model, 'mse') else 0.5
-                    idiosyncratic_shocks = np.random.normal(0, volatility * 1.5, size=steps)  # 1.5x for realism
+                    idiosyncratic_shocks = np.random.normal(0, volatility * 2.0, size=steps)  # Increased to 2.0x for more variation
                     tier2_sim[v] = pred.values + idiosyncratic_shocks
-                except Exception:
-                    tier2_sim[v] = self.df[v].mean()
+                except Exception as e:
+                    tier2_forecast_failures.append(f"{v}: {str(e)[:40]}")
+                    # Fallback: use random walk based on historical statistics
+                    hist = self.df[v].dropna()
+                    hist_std = hist.std() if not hist.empty else 0.0
+                    tier2_sim[v] = np.random.normal(hist.mean(), hist_std if hist_std > 0 else 0.01, size=steps)
             else:
-                tier2_sim[v] = self.df[v].mean()
+                # Model wasn't fitted - use historical mean with noise
+                tier2_forecast_failures.append(f"{v}: model not fitted")
+                hist = self.df[v].dropna()
+                hist_std = hist.std() if not hist.empty else 0.0
+                tier2_sim[v] = np.random.normal(hist.mean(), hist_std if hist_std > 0 else 0.01, size=steps)
+        
+        if tier2_forecast_failures:
+            print(f"  ⚠️  Tier 2 forecast issues: {', '.join(tier2_forecast_failures)}")
 
         # --- Tier 3 Simulation with IDIOSYNCRATIC SHOCKS ---
         tier3_sim = pd.DataFrame(index=future_index)
-        exog_combined = pd.concat([tier1_sim, tier2_sim], axis=1).fillna(0)
+        # Use only variables that were available during fitting
+        available_tier2 = getattr(self, 'available_tier2_vars', [v for v in self.tier2_vars if v in tier2_sim.columns])
+        exog_combined = pd.concat([tier1_sim[available_tier1], tier2_sim[available_tier2]], axis=1).fillna(0)
         # Ensure only columns used during fit are passed
-        valid_exog_cols = [c for c in exog_combined.columns if c in self.tier1_vars + self.tier2_vars]
+        valid_exog_cols = [c for c in exog_combined.columns if c in available_tier1 + available_tier2]
         
+        tier3_forecast_failures = []
         for v in self.tier3_vars:
             model = self.sarimax_models.get(v)
             if model:
@@ -357,12 +390,23 @@ class MarketSimulator:
                     # --- CRITICAL: INJECT INDEPENDENT IDIOSYNCRATIC SHOCKS ---
                     # Add volatility for supply shocks (strikes, shortages, immigration policy)
                     volatility = np.sqrt(model.mse) if hasattr(model, 'mse') else 0.3
-                    idiosyncratic_shocks = np.random.normal(0, volatility * 1.2, size=steps)
+                    idiosyncratic_shocks = np.random.normal(0, volatility * 1.5, size=steps)  # Increased variation
                     tier3_sim[v] = pred.values + idiosyncratic_shocks
-                except Exception:
-                    tier3_sim[v] = self.df[v].mean()
+                except Exception as e:
+                    tier3_forecast_failures.append(f"{v}: {str(e)[:40]}")
+                    # Fallback: use random walk based on historical statistics
+                    hist = self.df[v].dropna()
+                    hist_std = hist.std() if not hist.empty else 0.0
+                    tier3_sim[v] = np.random.normal(hist.mean(), hist_std if hist_std > 0 else 0.01, size=steps)
             else:
-                tier3_sim[v] = self.df[v].mean()
+                # Model wasn't fitted - use historical mean with noise
+                tier3_forecast_failures.append(f"{v}: model not fitted")
+                hist = self.df[v].dropna()
+                hist_std = hist.std() if not hist.empty else 0.0
+                tier3_sim[v] = np.random.normal(hist.mean(), hist_std if hist_std > 0 else 0.01, size=steps)
+        
+        if tier3_forecast_failures:
+            print(f"  ⚠️  Tier 3 forecast issues: {', '.join(tier3_forecast_failures)}")
 
         return pd.concat([tier1_sim, tier2_sim, tier3_sim], axis=1)
 
@@ -398,15 +442,34 @@ class MarketSimulator:
                 # Get the simulated row (Tiers 1-3)
                 sim_row = sim_world.iloc[[t]]
 
+                # Ensure sim_row has all columns from current_hist
+                for col in current_hist.columns:
+                    if col not in sim_row.columns:
+                        sim_row[col] = np.nan
+
                 # Append to history (Target return is NaN for now)
-                current_hist = pd.concat([current_hist, sim_row])
+                current_hist = pd.concat([current_hist, sim_row], axis=0)
+                current_hist = current_hist.ffill()
 
                 # Update features (Calculates Lags based on t-1, which has data)
-                tail = current_hist.iloc[-24:].copy()  # Look back enough for 12m lags
+                # Use wider lookback window to ensure enough history for all lags
+                start_idx = max(0, len(current_hist) - 50)
+                tail = current_hist.iloc[start_idx:].copy()
                 tail = self._update_lags_and_deltas(tail)
 
+                # Write all calculated features back to current_hist
+                for col in tail.columns:
+                    current_hist.loc[tail.index, col] = tail[col]
+
                 # Extract the row to predict (the very last one)
-                X_row = tail.iloc[[-1]][self.feature_columns]
+                try:
+                    X_row = current_hist.iloc[[-1]][self.feature_columns]
+                except KeyError:
+                    # Some feature columns may not exist, handle gracefully
+                    X_row = current_hist.iloc[[-1]].copy()
+                    for col in self.feature_columns:
+                        if col not in X_row.columns:
+                            X_row[col] = 0
 
                 # --- CRITICAL FIX: Handle NaNs and Infs ---
                 X_row = X_row.fillna(0).replace([np.inf, -np.inf], 0)
@@ -426,20 +489,40 @@ class MarketSimulator:
 
                 # Maintain cumulative log price for this iteration
                 if t == 0:
-                    # Initialize from last known log price if available in history, else use start_market_price
-                    if 'Log_Price' in current_hist.columns and not current_hist['Log_Price'].dropna().empty:
-                        current_log_price = float(current_hist['Log_Price'].dropna().iloc[-1])
-                    elif 'Market_Price' in current_hist.columns and not current_hist['Market_Price'].dropna().empty:
-                        current_log_price = float(np.log(current_hist['Market_Price'].dropna().iloc[-1]))
-                    else:
-                        current_log_price = float(np.log(self.start_market_price))
+                    # Initialize from last known price in history, or use start_market_price
+                    # We compute log price on-the-fly during simulation
+                    current_log_price = float(np.log(self.start_market_price))
 
                 # Update cumulative log price
                 current_log_price = current_log_price + pred_log_return
 
-                # Write returns and log price back to history so next step's Lag_1 is correct
+                # Write returns and log price back to history so next step's features can use lags
                 current_hist.at[current_date, self.price_col] = pred_log_return
-                current_hist.at[current_date, 'Log_Price'] = current_log_price
+                # Store log price internally for lags (if we ever need it in features)
+                if '_Log_Price_Internal' not in current_hist.columns:
+                    current_hist['_Log_Price_Internal'] = np.nan
+                current_hist.at[current_date, '_Log_Price_Internal'] = current_log_price
+
+                # --- DYNAMIC AFFORDABILITY RECALCULATION (after prediction) ---
+                try:
+                    # 1. Get last month's known affordability ratio
+                    last_affordability = current_hist['Affordability_Ratio'].dropna().iloc[-1]
+                    
+                    # 2. Get the current simulated Income Growth (YoY) and de-annualize it to a MoM factor
+                    current_income_yoy = current_hist['Income_Growth_YoY'].iloc[-1]
+                    monthly_income_factor = (1 + current_income_yoy) ** (1/12)
+                    
+                    # 3. Convert XGBoost's predicted log return into a simple price growth factor
+                    price_growth_factor = np.exp(pred_log_return)
+                    
+                    # 4. Calculate the new ratio 
+                    current_affordability = last_affordability * (price_growth_factor / monthly_income_factor)
+                    
+                    # 5. Write it back to the history dataframe immediately
+                    current_hist.at[current_date, 'Affordability_Ratio'] = current_affordability
+                except (KeyError, IndexError):
+                    # If affordability can't be calculated, use last known value
+                    pass
 
                 prices.append(float(np.exp(current_log_price)))
             
@@ -461,40 +544,57 @@ class MarketSimulator:
         
         return extended
 
-    def _reconstruct_levels(self, sim_df: pd.DataFrame) -> pd.DataFrame:
-        """Reconstruct absolute levels from growth rates."""
-        out = sim_df.copy()
-        for rate_col, level_col in self.growth_to_level_map.items():
-            if rate_col in out.columns and level_col in self.df.columns:
-                # Get last known actual level
-                last_level = self.df[level_col].iloc[-1]
-                
-                # Apply growth rates cumulatively
-                # New = Old * (1 + Rate)
-                rates = out[rate_col].values
-                new_levels = [last_level]
-                for r in rates:
-                    new_levels.append(new_levels[-1] * (1 + r))
-                
-                # Assign (skipping the first seed value)
-                out[level_col] = new_levels[1:]
-        return out
-
     def _update_lags_and_deltas(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Generate lags/deltas dynamically."""
+        """
+        Compute lags, deltas, and rolling averages for simulated exogenous variables.
+        Matches the feature engineering in processed_data.csv.
+        """
         out = df.copy()
-        # We need features for ALL variables (Tiers 1-3 and the return target, but NOT Log_Price which is internal)
-        cols_to_lag = [c for c in out.columns if c in self.tier1_vars + self.tier2_vars + self.tier3_vars + [self.price_col] + list(self.growth_to_level_map.values())]
-        
-        for col in cols_to_lag:
-            # Lags
-            out[f'{col}_lag_1'] = out[col].shift(1)
-            out[f'{col}_lag_12'] = out[col].shift(12)
-            
-            # Deltas (Handle potential division by zero)
-            out[f'{col}_delta_1m_pct'] = out[col].pct_change(1).replace([np.inf, -np.inf], 0)
-            out[f'{col}_delta_12m_pct'] = out[col].pct_change(12).replace([np.inf, -np.inf], 0)
-            
+
+        feature_cols = self.feature_columns or []
+        lag_periods = {}
+        delta_periods = {}
+        ra_periods = {}
+
+        for feat in feature_cols:
+            if '_lag_' in feat:
+                base, period = feat.rsplit('_lag_', 1)
+                if period.isdigit():
+                    lag_periods.setdefault(base, set()).add(int(period))
+            elif '_delta_' in feat:
+                base, period = feat.rsplit('_delta_', 1)
+                if period.isdigit():
+                    delta_periods.setdefault(base, set()).add(int(period))
+            elif '_RA_' in feat:
+                base, period = feat.rsplit('_RA_', 1)
+                if period.isdigit():
+                    ra_periods.setdefault(base, set()).add(int(period))
+
+        if not feature_cols:
+            base_cols = [c for c in out.columns if not any(tag in c for tag in ['_lag_', '_delta_', '_RA_'])]
+            base_cols = [c for c in base_cols if c not in {'date'}]
+            lag_periods = {c: {1, 3, 6, 12, 24} for c in base_cols}
+            delta_periods = {c: {1, 3, 6, 12} for c in base_cols}
+            ra_periods = {c: {6, 12, 24} for c in base_cols}
+
+        for base_col, periods in lag_periods.items():
+            if base_col not in out.columns or out[base_col].isna().all():
+                continue
+            for p in periods:
+                out[f'{base_col}_lag_{p}'] = out[base_col].shift(p)
+
+        for base_col, periods in delta_periods.items():
+            if base_col not in out.columns or out[base_col].isna().all():
+                continue
+            for p in periods:
+                out[f'{base_col}_delta_{p}'] = out[base_col].pct_change(p).replace([np.inf, -np.inf], 0)
+
+        for base_col, periods in ra_periods.items():
+            if base_col not in out.columns or out[base_col].isna().all():
+                continue
+            for p in periods:
+                out[f'{base_col}_RA_{p}'] = out[base_col].rolling(window=p).mean()
+
         return out
 
 
