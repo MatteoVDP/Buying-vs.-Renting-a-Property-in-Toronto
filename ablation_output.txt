@@ -1,0 +1,6 @@
+Fitting Tier 1 (ARIMA)...
+    ✓ GDP_Growth_YoY 
+    ✓ most_recent_quarterly_gdp_%_change_extended 
+    ✓ Inflation_Rate_YoY 
+    ✓ Inflation_Rate_MoM 
+    ✓ National_Pop_Growth_YoY 

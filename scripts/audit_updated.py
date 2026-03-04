@@ -62,122 +62,47 @@ def run_25_year_forecast():
     # Generate future dates
     future_index = pd.date_range(last_date + pd.offsets.MonthBegin(1), periods=steps, freq='MS')
 
-    # 5. BUILD EXOGENOUS DATA FOR FORECAST PERIOD
-    print("\n5. Generating exogenous variables for forecast period...")
-    sim_exog = sim.simulate_exogenous(steps=steps)
-
-    print(f"   ✓ Forecast horizon: {len(future_index)} months")
-    print(f"   Forecast period: {future_index[0].strftime('%B %Y')} to {future_index[-1].strftime('%B %Y')}")
+    # 5. RUN FORECAST USING SIMULATOR'S BUILT-IN METHOD (single iteration for audit)
+    print("\n5. Running single 25-year forecast using MarketSimulator.forecast_price()...")
+    print(f"   This uses the full 4-tier model (ARIMA/SARIMAX/XGBoost + sentiment)...")
     
-    # Create output DataFrame with exogenous variables
-    forecast_df = sim_exog.copy()
-    forecast_df.index = future_index
+    # Run 1 iteration with 300 months
+    forecast_result = sim.forecast_price(iterations=1, steps=steps)
     
-    # Predict log returns and convert to real prices from the base price
-    print("\n6. Predicting Log_Return_MoM and converting to real prices...")
-    base_hist = sim.df.copy()
-    current_hist = base_hist.copy()
+    # Extract price paths and full feature history
+    price_paths = forecast_result['price_paths']
+    full_history = forecast_result['full_history']
     
-    log_returns = []
-    price_path = []
-    affordability_path = []
-    current_log_price = float(np.log(start_market_price))
-    pred_log_return = 0  # Initialize for first iteration
+    # Get extended forecast with all variables and exogenous data
+    print(f"   ✓ Forecast complete: {len(price_paths)} months")
+    extended = sim.get_extended_forecast(forecast_result)
     
-    for t in range(steps):
-        current_date = future_index[t]
-        sim_row = sim_exog.iloc[[t]]
-        
-        # Ensure sim_row has all columns from current_hist
-        for col in current_hist.columns:
-            if col not in sim_row.columns:
-                sim_row[col] = np.nan
-        
-        current_hist = pd.concat([current_hist, sim_row], axis=0)
-        current_hist = current_hist.ffill()
-        
-        # --- DYNAMIC AFFORDABILITY RECALCULATION (before lags/deltas) ---
-        if t > 0:  # Can only calculate after first step
-            try:
-                # 1. Get last month's known affordability ratio
-                last_affordability_val = current_hist['Affordability_Ratio'].iloc[-2]  # -2 because we just added a row
-                
-                # 2. Get the current simulated Income Growth (YoY) and de-annualize it to a MoM factor
-                current_income_yoy = current_hist['Income_Growth_YoY'].iloc[-1]
-                monthly_income_factor = (1 + current_income_yoy) ** (1/12)
-                
-                # 3. Convert XGBoost's predicted log return into a simple price growth factor
-                price_growth_factor = np.exp(pred_log_return)
-                
-                # 4. Calculate the new ratio 
-                current_affordability = last_affordability_val * (price_growth_factor / monthly_income_factor)
-                
-                # 5. Write it back to the history dataframe immediately
-                current_hist.at[current_date, 'Affordability_Ratio'] = current_affordability
-            except (KeyError, IndexError) as e:
-                # Fallback: use last known value
-                current_affordability = current_hist['Affordability_Ratio'].dropna().iloc[-1]
-                current_hist.at[current_date, 'Affordability_Ratio'] = current_affordability
-        
-        # Update features (Calculates Lags, Deltas, and Rolling Averages)
-        # Use wider lookback window to ensure enough history for all lags
-        start_idx = max(0, len(current_hist) - 50)
-        tail = current_hist.iloc[start_idx:].copy()
-        tail = sim._update_lags_and_deltas(tail)
-        
-        # Write all calculated features back to current_hist
-        for col in tail.columns:
-            current_hist.loc[tail.index, col] = tail[col]
-        
-        # Extract the row to predict (the very last one)
-        try:
-            X_row = current_hist.iloc[[-1]][sim.feature_columns]
-        except KeyError:
-            # Some feature columns may not exist, handle gracefully
-            X_row = current_hist.iloc[[-1]].copy()
-            for col in sim.feature_columns:
-                if col not in X_row.columns:
-                    X_row[col] = 0
-        
-        X_row = X_row.fillna(0).replace([np.inf, -np.inf], 0)
-        
-        pred_log_return = float(sim.xgb_model.predict(X_row)[0])
-        log_returns.append(pred_log_return)
-        
-        current_log_price = current_log_price + pred_log_return
-        price_path.append(float(np.exp(current_log_price)))
-        
-        current_hist.at[current_date, sim.price_col] = pred_log_return
-        
-        # Store current affordability for output
-        try:
-            affordability_val = current_hist.at[current_date, 'Affordability_Ratio']
-        except:
-            affordability_val = np.nan
-        affordability_path.append(affordability_val)
-
-    # Extract forecast period from current_hist (which has all calculated lags/deltas/RAs)
-    print("\n   Extracting calculated features from forecast period...")
-    forecast_df = current_hist.loc[future_index].copy()
+    # 6. BUILD FORECAST DATAFRAME
+    print("\n6. Building forecast dataframe with all features...")
     
-    # Ensure Market_Price and Log_Price are in the dataframe
-    forecast_df['Market_Price'] = price_path
+    # Build forecast dataframe from extended forecast (already has all exogenous + engineered features)
+    forecast_df = extended.copy()
+    
+    # Extract prices from the full history (they were calculated during simulation)
+    forecast_start_idx = len(sim.df)
+    forecast_prices_from_history = full_history.iloc[forecast_start_idx:]['_Log_Price_Internal'].apply(np.exp).values.astype(float)
+    forecast_df['Market_Price'] = forecast_prices_from_history
+    
+    # Calculate log price
     forecast_df['Log_Price'] = np.log(forecast_df['Market_Price'])
     
-    # Calculate price statistics
+    # Calculate price change statistics
     forecast_df['Price_Change_MoM_%'] = forecast_df['Market_Price'].pct_change() * 100
     forecast_df['Price_Change_YoY_%'] = forecast_df['Market_Price'].pct_change(12) * 100
     
-    # Calculate affordability statistics
-    if 'Affordability_Ratio' in forecast_df.columns:
-        forecast_df['Affordability_Change_MoM_%'] = forecast_df['Affordability_Ratio'].pct_change() * 100
-        forecast_df['Affordability_Change_YoY_%'] = forecast_df['Affordability_Ratio'].pct_change(12) * 100
+
     
-    # Count how many lag/delta/RA columns are populated
+    # Count derived feature columns
     lag_cols = [c for c in forecast_df.columns if '_lag_' in c]
     delta_cols = [c for c in forecast_df.columns if '_delta_' in c]
     ra_cols = [c for c in forecast_df.columns if '_RA_' in c]
-    print(f"   Forecast dataframe has {len(lag_cols)} lag, {len(delta_cols)} delta, {len(ra_cols)} RA columns")
+    print(f"   ✓ Forecast complete: {len(forecast_df)} months, {len(forecast_df.columns)} columns")
+    print(f"   Derived features: {len(lag_cols)} lags, {len(delta_cols)} deltas, {len(ra_cols)} RAs")
     
     # 7. COMBINE HISTORICAL + FORECAST
     print("\n7. Combining historical and forecast data...")
@@ -213,64 +138,75 @@ def run_25_year_forecast():
     print(f"   ✓ Saved {len(combined_df)} rows × {len(combined_df.columns)} columns")
     
     # 9. CREATE VISUALIZATION
-    print("\n8. Creating price path visualization...")
+    print("\n9. Creating price path visualization...")
     
-    fig, axes = plt.subplots(2, 1, figsize=(14, 10))
+    # Extract the prices from the forecast dataframe
+    forecast_prices = forecast_df['Market_Price'].values.astype(float)
     
-    # --- MAIN PRICE PATH ---
-    ax = axes[0]
+    fig, axes = plt.subplots(2, 1, figsize=(15, 10))
     
-    # Historical prices (if available)
+    # --- SUBPLOT 1: PRICE PATH ---
+    ax1 = axes[0]
+    
+    # Historical prices (from combined_df)
     hist_mask = combined_df['Data_Source'] == 'Historical'
-    if hist_mask.any() and combined_df[hist_mask]['Market_Price'].notna().any():
-        hist_prices = combined_df[hist_mask]
-        ax.plot(hist_prices.index, hist_prices['Market_Price'], 
-               color='navy', linewidth=2.5, label='Historical', alpha=0.9)
+    if hist_mask.any():
+        hist_data = combined_df[hist_mask].copy()
+        # Get Market_Price from CSV if it exists, otherwise mark as unavailable
+        if 'Market_Price' in hist_data.columns and hist_data['Market_Price'].notna().any():
+            ax1.plot(hist_data.index, hist_data['Market_Price'], 
+                    color='navy', linewidth=2.5, label='Historical Prices', alpha=0.9, marker='o', markersize=2)
+        else:
+            ax1.text(0.05, 0.95, '(Historical prices not available in dataset)', 
+                    transform=ax1.transAxes, fontsize=9, style='italic', alpha=0.6, va='top')
     
-    # Forecast prices
-    forecast_mask = combined_df['Data_Source'] == 'Forecast'
-    forecast_data = combined_df[forecast_mask]
-    ax.plot(forecast_data.index, forecast_data['Market_Price'], 
-           color='crimson', linewidth=2.5, label='Forecast (to March 2050)', 
-           linestyle='--', alpha=0.8)
+    # Forecast prices (from simulation)
+    ax1.plot(future_index, forecast_prices, 
+            color='crimson', linewidth=2.5, label='Forecast (25-year horizon)', 
+            linestyle='-', alpha=0.85, marker='o', markersize=1)
     
     # Add vertical line at forecast start
-    ax.axvline(x=last_date, color='gray', linestyle=':', linewidth=1.5, alpha=0.7, label='Forecast Start')
+    ax1.axvline(x=last_date, color='gray', linestyle='--', linewidth=1.5, alpha=0.5)
+    ax1.text(last_date, ax1.get_ylim()[1] * 0.95, ' Forecast Start', 
+            fontsize=9, color='gray', va='top')
     
     # Formatting
-    ax.set_title('25-Year Market Price Forecast: March 2025 - March 2050', 
-                fontsize=14, fontweight='bold', pad=20)
-    ax.set_xlabel('Date', fontsize=11, fontweight='bold')
-    ax.set_ylabel('Market Price ($)', fontsize=11, fontweight='bold')
-    ax.grid(True, alpha=0.3, linestyle='--')
-    ax.legend(loc='best', fontsize=10, framealpha=0.95)
+    ax1.set_title('Toronto Housing Market: Historical + 25-Year Forecast (March 2025 - March 2050)', 
+                 fontsize=14, fontweight='bold', pad=15)
+    ax1.set_xlabel('Date', fontsize=11, fontweight='bold')
+    ax1.set_ylabel('Market Price ($)', fontsize=11, fontweight='bold')
+    ax1.grid(True, alpha=0.3, linestyle='--')
+    ax1.legend(loc='upper left', fontsize=10, framealpha=0.95)
     
     # Format y-axis as currency
-    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'${x/1e6:.1f}M'))
+    ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'${x/1e6:.2f}M'))
     
     # Format x-axis dates
-    ax.xaxis.set_major_locator(mdates.YearLocator(2))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
-    plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+    ax1.xaxis.set_major_locator(mdates.YearLocator(3))
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+    plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45, ha='right')
     
-    # --- MONTHLY % CHANGE ---
+    # --- SUBPLOT 2: MONTHLY RETURNS ---
     ax2 = axes[1]
     
-    forecast_changes = forecast_data['Price_Change_MoM_%'].dropna()
-    ax2.bar(forecast_data.index[1:], forecast_changes, 
-           color=['green' if x > 0 else 'red' for x in forecast_changes],
-           alpha=0.6, width=20, label='Monthly % Change')
-    
-    ax2.axhline(y=0, color='black', linestyle='-', linewidth=0.8, alpha=0.5)
-    ax2.set_title('Monthly Price Changes (%)', fontsize=12, fontweight='bold', pad=15)
-    ax2.set_xlabel('Date', fontsize=11, fontweight='bold')
-    ax2.set_ylabel('% Change', fontsize=11, fontweight='bold')
-    ax2.grid(True, alpha=0.3, linestyle='--', axis='y')
-    
-    # Format x-axis dates
-    ax2.xaxis.set_major_locator(mdates.YearLocator(2))
-    ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
-    plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45, ha='right')
+    if len(forecast_prices) > 1:
+        monthly_returns = forecast_prices[1:] / forecast_prices[:-1] - 1
+        ax2.plot(future_index[1:], monthly_returns, 
+                color='crimson', linewidth=1.5, alpha=0.7, marker='o', markersize=2)
+        ax2.axhline(y=0, color='black', linestyle='-', linewidth=0.8, alpha=0.3)
+        ax2.set_title('Monthly Price Growth Rate', fontsize=12, fontweight='bold', pad=15)
+        ax2.set_xlabel('Date', fontsize=11, fontweight='bold')
+        ax2.set_ylabel('Growth Rate', fontsize=11, fontweight='bold')
+        ax2.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x*100:.2f}%'))
+        ax2.grid(True, alpha=0.3, linestyle='--', axis='y')
+        
+        # Format x-axis dates
+        ax2.xaxis.set_major_locator(mdates.YearLocator(3))
+        ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+        plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45, ha='right')
+    else:
+        ax2.text(0.5, 0.5, 'Insufficient data for visualization', 
+                ha='center', va='center', transform=ax2.transAxes)
     
     plt.tight_layout()
     
@@ -283,17 +219,18 @@ def run_25_year_forecast():
     print("\n10. Forecast Summary Statistics:")
     print("   " + "="*76)
     
-    forecast_prices_only = forecast_data['Market_Price'].dropna()
-    
-    if len(forecast_prices_only) > 0:
-        initial_price = forecast_prices_only.iloc[0]
-        final_price = forecast_prices_only.iloc[-1]
-        min_price = forecast_prices_only.min()
-        max_price = forecast_prices_only.max()
-        mean_price = forecast_prices_only.mean()
+    if len(forecast_prices) > 0:
+        initial_price = forecast_prices[0]
+        final_price = forecast_prices[-1]
+        min_price = np.min(forecast_prices)
+        max_price = np.max(forecast_prices)
+        mean_price = np.mean(forecast_prices)
         
         total_change_pct = ((final_price / initial_price) - 1) * 100
         total_change_avg_annual = ((final_price / initial_price) ** (1/25) - 1) * 100
+        
+        # Calculate monthly returns
+        monthly_returns = forecast_prices[1:] / forecast_prices[:-1] - 1
         
         print(f"   Initial Price (Start of Forecast): ${initial_price:,.2f}")
         print(f"   Final Price (March 2050):          ${final_price:,.2f}")
@@ -302,43 +239,14 @@ def run_25_year_forecast():
         print(f"   Mean Price:                        ${mean_price:,.2f}")
         print(f"\n   Total 25-Year Change:              {total_change_pct:+.2f}%")
         print(f"   Average Annual Growth Rate:        {total_change_avg_annual:+.2f}%")
-        print(f"\n   Monthly Returns - Mean:            {forecast_data['Price_Change_MoM_%'].mean():+.3f}%")
-        print(f"   Monthly Returns - Std Dev:         {forecast_data['Price_Change_MoM_%'].std():.3f}%")
-        print(f"   Monthly Returns - Min:             {forecast_data['Price_Change_MoM_%'].min():+.3f}%")
-        print(f"   Monthly Returns - Max:             {forecast_data['Price_Change_MoM_%'].max():+.3f}%")
-    
-    # Affordability Statistics
-    print("\n   " + "-"*76)
-    print("   AFFORDABILITY RATIO STATISTICS:")
-    print("   " + "-"*76)
-    
-    if 'Affordability_Ratio' in forecast_data.columns:
-        affordability_valid = forecast_data['Affordability_Ratio'].dropna()
-        if len(affordability_valid) > 0:
-            initial_afford = affordability_valid.iloc[0]
-            final_afford = affordability_valid.iloc[-1]
-            min_afford = affordability_valid.min()
-            max_afford = affordability_valid.max()
-            mean_afford = affordability_valid.mean()
-            
-            afford_change_pct = ((final_afford / initial_afford) - 1) * 100 if initial_afford != 0 else 0
-            
-            print(f"   Initial Affordability:             {initial_afford:,.4f}")
-            print(f"   Final Affordability (March 2050):  {final_afford:,.4f}")
-            print(f"   Lowest Affordability:              {min_afford:,.4f}")
-            print(f"   Highest Affordability:             {max_afford:,.4f}")
-            print(f"   Mean Affordability:                {mean_afford:,.4f}")
-            print(f"   25-Year Change:                    {afford_change_pct:+.2f}%")
-            print(f"   Monthly Change - Mean:             {forecast_data['Affordability_Change_MoM_%'].mean():+.3f}%")
-            print(f"   Monthly Change - Std Dev:          {forecast_data['Affordability_Change_MoM_%'].std():.3f}%")
-        else:
-            print("   ⚠️  No affordability values found in forecast")
-    else:
-        print("   ⚠️  Affordability_Ratio column not in forecast data")
+        print(f"\n   Monthly Returns - Mean:            {np.mean(monthly_returns)*100:+.3f}%")
+        print(f"   Monthly Returns - Std Dev:         {np.std(monthly_returns)*100:.3f}%")
+        print(f"   Monthly Returns - Min:             {np.min(monthly_returns)*100:+.3f}%")
+        print(f"   Monthly Returns - Max:             {np.max(monthly_returns)*100:+.3f}%")
     
     # Feature Engineering Diagnostics
     print("\n   " + "-"*76)
-    print("   FEATURE ENGINEERING DIAGNOSTICS:")
+    print("   DERIVED FEATURES DIAGNOSTICS:")
     print("   " + "-"*76)
     
     # Check for lag/delta/RA columns

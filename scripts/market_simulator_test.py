@@ -17,7 +17,7 @@ except ImportError:
 
 class MarketSimulator:
     """
-    4-Tier Monte Carlo Housing Market Simulator.
+    4-Tier Housing Market Forecast Simulator.
     Fixes applied: Infinity handling, Target Leakage prevention, Explicit Level Reconstruction.
     """
 
@@ -90,26 +90,9 @@ class MarketSimulator:
         self.sarimax_models = {}
         self.xgb_model = None
         self.feature_columns = None
-        
-        # --- 3. EXTREME EVENT CONFIGURATION ---
-        # Noise reduction for Tier 1 variables (macro indicators)
-        self.tier1_noise_scale = 1.0  # 2% residual noise for realistic variation
-        
-        # Refined Black Swan: Lower probability, moderate impact, auto-recovery
-        self.black_swan_prob = 0  # Disabled - use only model dynamics
-        
-        # Doomsday Scenario: Catastrophic tail risk (0.0417% per month = 1 in 2,400 = ~1 every 200 years)
-        self.doomsday_prob = 0 #0.0004167  # Increased magnitude (was 0.00001)
-        self.doomsday_crash_magnitude = 0.18  # 15-20% crash over 24 months
-        self.doomsday_duration_months = 24  # 2-year unfolding period
-        
-        # --- SENTIMENT & BIAS CONFIGURATION (Market Optimism Tuning) ---
-        # Baseline + 20% optimism increase from neutral
-        # Restores baseline, then adds subtle upward bias (0.1% monthly drift)
-        # The "Steady Real Estate" Configuration
-        self.sentiment_shock_mean = 0.0001    # +0.1% monthly bias (~1.2% annualized upward drift)
-        self.sentiment_shock_std = 0.008     # 0.020 for realistic numbers
-        self.sentiment_mean_reversion = 0.25 # Shocks fade out quickly (prevents 10-year death spirals)
+
+        # Tier 1 residual-noise injection scale
+        self.tier1_noise_scale = 10
 
     def fit(self, train_df: pd.DataFrame = None):
         """Fit all tiers: ARIMA (Tier 1), SARIMAX (Tier 2/3), XGBoost (Tier 4)."""
@@ -144,13 +127,18 @@ class MarketSimulator:
                 if False: #use_seasonal:
                     model = pm.auto_arima(series, seasonal=True, m=12,
                                           error_action='ignore', suppress_warnings=True, 
-                                          stepwise=True, max_p=2, max_q=2, max_P=1, max_Q=1,
+                                          stepwise=True, max_p=2, max_q=2, #max_P=1, max_Q=1,
                                           trace=False, n_jobs=-1)
                 else:
-                    model = pm.auto_arima(series, seasonal=False,
-                                          error_action='ignore', suppress_warnings=True, 
-                                          stepwise=True, max_p=2, max_q=2, max_d=1,d=0,
-                                          trace=False, n_jobs=-1)
+                    model = pm.auto_arima(
+                            series, 
+                            seasonal=False,    
+                            error_action='ignore', 
+                            suppress_warnings=True, 
+                            stepwise=True, 
+                            max_p=2, max_q=2,
+                            trace=False, 
+                            n_jobs=-1)
                 self.arima_models[v] = model
                 tier1_success += 1
                 seasonal_str = "(seasonal)" if use_seasonal else ""
@@ -237,7 +225,7 @@ class MarketSimulator:
         # Use all columns from processed_data EXCEPT target/date and leakage-prone state trackers
         # Keep Affordability_Ratio_MoM in the dataframe for simulation/state updates,
         # but exclude it from model training features.
-        exclude_cols = {self.price_col, 'date', 'Affordability_Ratio_MoM','Affordability_Ratio_MoM_delta_3', 'Affordability_Ratio_MoM_delta_12', 'Affordability_Ratio_MoM_lag_1', 'Affordability_Ratio_MoM_lag_3', 'Affordability_Ratio_MoM_RA_12', 'Affordability_Ratio_MoM_RA_24', 'Log_Return_MoM_RA_3', 'Log_Return_MoM_lag_1', 'Log_Return_MoM_lag_3', 'Log_Return_MoM_lag_6', 'Log_Return_MoM_lag_12', 'Affordability_Deviation_lag_1', 'Affordability_Deviation_lag_3', 'Affordability_Deviation_delta_3','Affordability_Deviation'}
+        exclude_cols = {self.price_col, 'date', 'Affordability_Ratio_MoM','Affordability_Ratio_MoM_delta_3', 'Affordability_Ratio_MoM_delta_12','Affordability_Ratio_MoM_lag_1', 'Affordability_Ratio_MoM_lag_3', 'Affordability_Ratio_MoM_RA_12', 'Affordability_Ratio_MoM_RA_24', 'Log_Return_MoM_RA_12', 'Log_Return_MoM_lag_1', 'Log_Return_MoM_lag_3', 'Log_Return_MoM_lag_6', 'Log_Return_MoM_lag_12', 'Affordability_Deviation_lag_1', 'Affordability_Deviation_lag_3', 'Affordability_Deviation_delta_3','Affordability_Deviation'}
         feature_cols = [c for c in train_df.columns if c not in exclude_cols]
         
         # Drop rows where target is NaN
@@ -266,124 +254,38 @@ class MarketSimulator:
         last_date = self.df.index.max()
         future_index = pd.date_range(last_date + pd.offsets.MonthBegin(1), periods=steps, freq='MS')
 
-        def _deterministic_fallback(series: pd.Series, steps: int) -> np.ndarray:
-            """Fallback path based only on historical values (no random shocks)."""
-            hist = series.dropna()
-            if hist.empty:
-                return np.zeros(steps)
-
-            last_value = float(hist.iloc[-1])
-            if len(hist) >= 6:
-                recent_deltas = hist.diff().dropna().tail(6)
-                drift = float(recent_deltas.mean()) if not recent_deltas.empty else 0.0
-            elif len(hist) >= 2:
-                drift = float(hist.iloc[-1] - hist.iloc[-2])
-            else:
-                drift = 0.0
-
-            step_index = np.arange(1, steps + 1, dtype=float)
-            return last_value + drift * step_index
-        
-        # --- Tier 1 Simulation with REDUCED NOISE ---
+        # --- Tier 1 Simulation ---
         tier1_sim = pd.DataFrame(index=future_index)
         for v in self.tier1_vars:
             model = self.arima_models.get(v)
             if model:
-                # Predict and add SCALED noise from residuals
-                #try:
-                fc = model.predict(n_periods=steps)
-                resid = model.resid()
-                last_real_value = self.df[v].dropna().iloc[-1]
-                # Bootstrap residuals, then scale down by self.tier1_noise_scale
-                raw_noise = np.random.choice(4*resid, size=steps, replace=True)
-                noise = pd.Series(raw_noise).ewm(span=3).mean().values
-                tier1_sim[v] = fc + self.tier1_noise_scale * noise  # REDUCED NOISE
-                #except Exception:
-                    # Deterministic fallback for tier 1 if ARIMA prediction fails
-                    #tier1_sim[v] = _deterministic_fallback(self.df[v], steps)
+                try:
+                    fc = np.asarray(model.predict(n_periods=steps))
+                    resid = np.asarray(model.resid())
+                    noise = np.random.choice(resid, size=steps, replace=True)
+                    tier1_sim[v] = fc + self.tier1_noise_scale * noise
+                except Exception as e:
+                    raise RuntimeError(f"Tier 1 forecast failed for {v}: {e}") from e
             else:
-                # Deterministic fallback for tier 1 if model wasn't fitted
-                #tier1_sim[v] = noise #_deterministic_fallback(self.df[v], steps)
-                print("NOISE")
+                raise RuntimeError(f"Tier 1 model not fitted for {v}")
         
-        # --- DOOMSDAY SCENARIO: Catastrophic tail risk (0.001% per month) ---
-        doomsday_triggered = np.random.random() < self.doomsday_prob
-        doomsday_start_month = None
-        
-        if doomsday_triggered and steps > self.doomsday_duration_months:
-            # Doomsday occurs at a random month with enough runway
-            doomsday_start_month = np.random.randint(0, steps - self.doomsday_duration_months)
-            print(f"⚠️  DOOMSDAY SCENARIO TRIGGERED at month {doomsday_start_month}")
-            
-            # Apply cascading collapse to Tier 1 variables
-            for month_offset in range(self.doomsday_duration_months):
-                crisis_month_idx = doomsday_start_month + month_offset
-                if crisis_month_idx >= steps:
-                    break
-                
-                # Severity decreases over time (front-loaded crash)
-                severity_decay = 1.0 - (month_offset / self.doomsday_duration_months) ** 2
-                
-                # GDP shock: severe decline in first year, partial recovery in second
-                if month_offset < 12:
-                    gdp_shock = -0.08 * severity_decay  # Up to -8% GDP
-                else:
-                    gdp_shock = -0.02 * severity_decay  # Stabilizing year 2
-                tier1_sim.iloc[crisis_month_idx, tier1_sim.columns.get_loc('GDP_Growth_YoY')] = gdp_shock
-                
-                # Population/migration shocks (people leave crisis zones)
-                if 'National_Pop_Growth_YoY' in tier1_sim.columns:
-                    pop_shock = -0.03 * severity_decay
-                    tier1_sim.iloc[crisis_month_idx, tier1_sim.columns.get_loc('National_Pop_Growth_YoY')] = pop_shock
-                
-                # Inflation spike early (supply chain destruction), then normalizes
-                if 'Inflation_Rate_YoY' in tier1_sim.columns:
-                    if month_offset < 6:
-                        inflation_shock = 0.08  # Inflation spike
-                    else:
-                        inflation_shock = 0.02 * severity_decay  # Deflation risk
-                    tier1_sim.iloc[crisis_month_idx, tier1_sim.columns.get_loc('Inflation_Rate_YoY')] = inflation_shock
-            
-
-        
-        # --- BLACK SWAN EVENTS: Refined - Rare regime shifts (0.1% per month) ---
-        # Lower probability than doomsday but quicker resolution
-        black_swan_months = [i for i in range(steps) if np.random.random() < self.black_swan_prob]
-        for month_idx in black_swan_months:
-            # Skip if this month is in doomsday crisis (avoid double-shocking)
-            if doomsday_start_month is not None:
-                if doomsday_start_month <= month_idx < doomsday_start_month + self.doomsday_duration_months:
-                    continue
-            
-            # Moderate GDP shock with faster recovery
-            tier1_sim.iloc[month_idx, tier1_sim.columns.get_loc('GDP_Growth_YoY')] = -0.03
-            
-
-
         # --- Tier 2 Simulation (SARIMAX forecast) ---
         tier2_sim = pd.DataFrame(index=future_index)
         # Use only variables that were available during fitting
         available_tier1 = getattr(self, 'available_tier1_vars', [v for v in self.tier1_vars if v in tier1_sim.columns])
         exog_tier1 = tier1_sim[available_tier1].fillna(0)
         
-        tier2_forecast_failures = []
         for v in self.tier2_vars:
             model = self.sarimax_models.get(v)
             if model:
                 try:
+                    # Predict all steps using simulated Tier 1 exogenous inputs
                     pred = model.get_forecast(steps=steps, exog=exog_tier1).predicted_mean
                     tier2_sim[v] = pred.values
                 except Exception as e:
-                    tier2_forecast_failures.append(f"{v}: {str(e)[:40]}")
-                    # Deterministic fallback based only on historical trajectory
-                    tier2_sim[v] = _deterministic_fallback(self.df[v], steps)
+                    raise RuntimeError(f"Tier 2 forecast failed for {v}: {e}") from e
             else:
-                # Model wasn't fitted - deterministic fallback from history
-                tier2_forecast_failures.append(f"{v}: model not fitted")
-                tier2_sim[v] = _deterministic_fallback(self.df[v], steps)
-        
-        if tier2_forecast_failures:
-            print(f"  ⚠️  Tier 2 forecast issues: {', '.join(tier2_forecast_failures)}")
+                raise RuntimeError(f"Tier 2 model not fitted for {v}")
 
         # --- Tier 3 Simulation (SARIMAX forecast) ---
         tier3_sim = pd.DataFrame(index=future_index)
@@ -392,7 +294,6 @@ class MarketSimulator:
         exog_combined = pd.concat([tier1_sim[available_tier1], tier2_sim[available_tier2]], axis=1).fillna(0)
         # Ensure only columns used during fit are passed
         valid_exog_cols = [c for c in exog_combined.columns if c in available_tier1 + available_tier2]
-        tier3_forecast_failures = []
         for v in self.tier3_vars:
             model = self.sarimax_models.get(v)
             if model:
@@ -400,28 +301,21 @@ class MarketSimulator:
                     pred = model.get_forecast(steps=steps, exog=exog_combined[valid_exog_cols]).predicted_mean
                     tier3_sim[v] = pred.values
                 except Exception as e:
-                    tier3_forecast_failures.append(f"{v}: {str(e)[:40]}")
-                    # Deterministic fallback based only on historical trajectory
-                    tier3_sim[v] = _deterministic_fallback(self.df[v], steps)
+                    raise RuntimeError(f"Tier 3 forecast failed for {v}: {e}") from e
             else:
-                # Model wasn't fitted - deterministic fallback from history
-                tier3_forecast_failures.append(f"{v}: model not fitted")
-                tier3_sim[v] = _deterministic_fallback(self.df[v], steps)
-        
-        if tier3_forecast_failures:
-            print(f"  ⚠️  Tier 3 forecast issues: {', '.join(tier3_forecast_failures)}")
+                raise RuntimeError(f"Tier 3 model not fitted for {v}")
 
         return pd.concat([tier1_sim, tier2_sim, tier3_sim], axis=1)
 
     def forecast_price(self, iterations: int = 100, steps: int = 300):
-        """Recursive XGBoost Loop with Market Sentiment & Bubbles."""
+        """Recursive XGBoost forecast loop."""
         if self.xgb_model is None:
             raise RuntimeError("Model not fitted.")
 
         all_paths = pd.DataFrame()
         base_hist = self.df.copy()
 
-        print(f"Running {iterations} Monte Carlo iterations (with sentiment/bubbles)...")
+        print(f"Running {iterations} forecast iterations...")
         
         for i in range(iterations):
             if i % 10 == 0:
@@ -434,9 +328,6 @@ class MarketSimulator:
             current_hist = base_hist.copy()
             
             prices = []
-            
-            # --- SENTIMENT ACCUMULATOR: Initialize for this iteration ---
-            sentiment_score = 0.0
             
             # 3. Recursive Loop: now the model predicts monthly log RETURNS (Log_Return_MoM)
             for t in range(steps):
@@ -475,6 +366,7 @@ class MarketSimulator:
                     X_row = current_hist.iloc[[-1]][self.feature_columns]
                 except KeyError:
                     # Some feature columns may not exist, handle gracefully
+                    print("FUCK")
                     X_row = current_hist.iloc[[-1]].copy()
                     for col in self.feature_columns:
                         if col not in X_row.columns:
@@ -485,16 +377,7 @@ class MarketSimulator:
 
                 # --- TIER 4: Predict monthly log RETURN (from XGBoost) ---
                 rational_log_return = float(self.xgb_model.predict(X_row)[0])
-
-                # --- MARKET SENTIMENT & BUBBLES (applied to returns) with CONFIGURABLE OPTIMISM ---
-                # Generate sentiment shock from configurable distribution
-                # - sentiment_shock_mean controls optimism bias (positive = bullish)
-                # - sentiment_shock_std controls volatility
-                monthly_shock = np.random.normal(self.sentiment_shock_mean, self.sentiment_shock_std)
-                sentiment_score = (sentiment_score * self.sentiment_mean_reversion) + monthly_shock
-
-                # Preliminary predicted log return (XGBoost + sentiment)
-                pred_log_return = rational_log_return + sentiment_score
+                pred_log_return = rational_log_return
 
                 # Maintain cumulative log price for this iteration
                 if t == 0:
@@ -576,7 +459,7 @@ class MarketSimulator:
             extended['Price_95pct'] = np.exp(price_paths.quantile(0.95, axis=1))
             return extended
         
-        # Fallback: Re-simulate exogenous if full history not available
+        # Re-simulate exogenous if full history not available
         sim = self.simulate_exogenous(steps=len(price_paths))
         
         # Calculate price percentiles
@@ -712,7 +595,7 @@ class MarketSimulator:
                 out['month_sin'] = [month_sin_lookup[m] for m in months]
                 out['month_cos'] = [month_cos_lookup[m] for m in months]
         except Exception as e:
-            # Fallback: leave as NaN if extraction fails
+            # Leave as NaN if extraction fails
             pass
 
         return out

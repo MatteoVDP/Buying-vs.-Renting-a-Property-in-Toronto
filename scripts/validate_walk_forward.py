@@ -16,8 +16,12 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
+import inspect
 import warnings
-from market_simulator import MarketSimulator
+try:
+    from market_simulator import MarketSimulator
+except ModuleNotFoundError:
+    from scripts.market_simulator import MarketSimulator
 
 warnings.filterwarnings("ignore")
 
@@ -54,11 +58,39 @@ def load_data():
     df = pd.read_csv(DATA_PATH)
     df['date'] = pd.to_datetime(df['date'])
     df = df.sort_values('date').reset_index(drop=True)
+    df = add_reconstructed_market_prices(df)
     
     print(f"✓ Loaded {len(df)} records")
     print(f"✓ Date range: {df['date'].min().date()} to {df['date'].max().date()}")
     print()
     
+    return df
+
+
+def get_simulator_reference_price():
+    """Read MarketSimulator's default starting market price from its signature."""
+    return float(inspect.signature(MarketSimulator.__init__).parameters['start_market_price'].default)
+
+
+def add_reconstructed_market_prices(df):
+    """
+    Reconstruct absolute market prices from Log_Return_MoM using the simulator's
+    default reference price anchored at the last historical observation.
+    """
+    if 'Log_Return_MoM' not in df.columns:
+        raise ValueError("Dataset must include 'Log_Return_MoM' for price reconstruction")
+
+    reference_price = get_simulator_reference_price()
+    returns = df['Log_Return_MoM'].fillna(0).values.astype(float)
+
+    reconstructed_prices = np.zeros(len(df), dtype=float)
+    reconstructed_prices[-1] = reference_price
+
+    for idx in range(len(df) - 1, 0, -1):
+        reconstructed_prices[idx - 1] = reconstructed_prices[idx] / np.exp(returns[idx])
+
+    df = df.copy()
+    df['Reconstructed_Market_Price'] = reconstructed_prices
     return df
 
 
@@ -80,10 +112,8 @@ def split_data(df, train_end_date):
     train_df = df[df['date'] <= cutoff].copy()
     test_df = df[df['date'] > cutoff].copy()
     
-    # Compute anchor price: exp(Log_Price_lag_1 + Log_Return_MoM)
-    last_row = train_df.iloc[-1]
-    log_price_current = last_row['Log_Price_lag_1'] + last_row['Log_Return_MoM']
-    anchor_price = float(np.exp(log_price_current))
+    # Compute anchor price from reconstructed absolute market price
+    anchor_price = float(train_df['Reconstructed_Market_Price'].iloc[-1])
     
     return train_df, test_df, anchor_price
 
@@ -156,27 +186,31 @@ def calculate_distribution_coverage(actual, all_paths):
     return coverage_pct
 
 
-def reconstruct_actual_prices(test_df, anchor_price):
+def reconstruct_actual_prices(test_df):
     """
     Reconstruct actual market prices from log returns.
     
     Args:
         test_df: Test portion of the dataset
-        anchor_price: Starting price (last price from training data)
     
     Returns:
         prices: Array of reconstructed prices
     """
-    # Initialize with anchor price
-    log_price = np.log(anchor_price)
-    prices = []
-    
-    for idx, row in test_df.iterrows():
-        log_return = row['Log_Return_MoM']
-        log_price += log_return
-        prices.append(np.exp(log_price))
-    
-    return np.array(prices)
+    return test_df['Reconstructed_Market_Price'].values.astype(float)
+
+
+def extract_price_paths(forecast_result):
+    """
+    Normalize MarketSimulator.forecast_price output across versions.
+
+    New format: dict with {'price_paths': DataFrame, 'full_history': DataFrame}
+    Legacy format: DataFrame of price paths
+    """
+    if isinstance(forecast_result, dict):
+        if 'price_paths' not in forecast_result:
+            raise ValueError("forecast_price() dict output missing 'price_paths'")
+        return forecast_result['price_paths']
+    return forecast_result
 
 
 def run_fold_validation(fold_idx, fold_config, df):
@@ -195,108 +229,109 @@ def run_fold_validation(fold_idx, fold_config, df):
     print(f"FOLD {fold_idx + 1}/6: Train up to {fold_config['train_end']}")
     print(f"          Forecast: {fold_config['test_start']} to {fold_config['test_end']}")
     print("=" * 80)
-    
+
+    # Step 1: Split data
+    train_df, test_df, anchor_price = split_data(df, fold_config['train_end'])
+    anchor_date = train_df['date'].iloc[-1]
+
+    print(f"✓ Training samples: {len(train_df)} months")
+    print(f"✓ Testing samples: {len(test_df)} months (target: {FORECAST_HORIZON})")
+    print(f"✓ Anchor date: {anchor_date.date()}")
+    print(f"✓ Anchor price: ${anchor_price:,.2f}")
+
+    # Verify we have enough test data
+    if len(test_df) < FORECAST_HORIZON:
+        print(f"⚠ WARNING: Partial test period ({len(test_df)} < {FORECAST_HORIZON} months)")
+        print(f"   Will evaluate on available {len(test_df)} months")
+        actual_horizon = len(test_df)
+    else:
+        actual_horizon = FORECAST_HORIZON
+
+    # Truncate test data to the actual horizon
+    test_df = test_df.iloc[:actual_horizon].copy()
+
+    # Step 2: Initialize and train the MarketSimulator (ONCE per fold)
+    print("\n[1/4] Initializing MarketSimulator...")
+    simulator = MarketSimulator(
+        df=train_df,
+        seed=BASE_SEED,
+        start_market_price=anchor_price
+    )
+
+    print("[2/4] Training model on historical data...")
+    simulator.fit()
+
+    # Step 3: Run Monte Carlo simulations (10 paths in one call)
+    print(f"[3/4] Running {MONTE_CARLO_ITERATIONS} Monte Carlo simulations...")
+    np.random.seed(BASE_SEED)
     try:
-        # Step 1: Split data
-        train_df, test_df, anchor_price = split_data(df, fold_config['train_end'])
-        anchor_date = train_df['date'].iloc[-1]
-        
-        print(f"✓ Training samples: {len(train_df)} months")
-        print(f"✓ Testing samples: {len(test_df)} months (target: {FORECAST_HORIZON})")
-        print(f"✓ Anchor date: {anchor_date.date()}")
-        print(f"✓ Anchor price: ${anchor_price:,.2f}")
-        
-        # Verify we have enough test data
-        if len(test_df) < FORECAST_HORIZON:
-            print(f"⚠ WARNING: Partial test period ({len(test_df)} < {FORECAST_HORIZON} months)")
-            print(f"   Will evaluate on available {len(test_df)} months")
-            actual_horizon = len(test_df)
-        else:
-            actual_horizon = FORECAST_HORIZON
-        
-        # Truncate test data to the actual horizon
-        test_df = test_df.iloc[:actual_horizon].copy()
-        
-        # Step 2: Initialize and train the MarketSimulator (ONCE per fold)
-        print("\n[1/4] Initializing MarketSimulator...")
-        simulator = MarketSimulator(
-            df=train_df,
-            seed=BASE_SEED,
-            start_market_price=anchor_price
-        )
-        
-        print("[2/4] Training model on historical data...")
-        simulator.fit()
-        
-        # Step 3: Run Monte Carlo simulations (10 paths in one call)
-        print(f"[3/4] Running {MONTE_CARLO_ITERATIONS} Monte Carlo simulations...")
-        np.random.seed(BASE_SEED)
-        all_forecast_paths = simulator.forecast_price(
-            iterations=MONTE_CARLO_ITERATIONS, 
+        forecast_result = simulator.forecast_price(
+            iterations=MONTE_CARLO_ITERATIONS,
             steps=actual_horizon
         )
-        
-        # Step 4: Calculate median forecast
-        median_forecast = all_forecast_paths.median(axis=1).values
-        
-        # Step 5: Reconstruct actual prices from test data
-        print("[4/4] Calculating performance metrics...")
-        actual_prices = reconstruct_actual_prices(test_df, anchor_price)
-        
-        # Step 6: Calculate all metrics
-        mape = calculate_mape(actual_prices, median_forecast)
-        rmse = calculate_rmse(actual_prices, median_forecast)
-        directional_acc = calculate_directional_accuracy(actual_prices, median_forecast)
-        
-        # CAGR calculations
-        years = actual_horizon / 12.0  # Actual years covered
-        actual_cagr = calculate_cagr(actual_prices[0], actual_prices[-1], years)
-        forecast_cagr = calculate_cagr(median_forecast[0], median_forecast[-1], years)
-        cagr_error = forecast_cagr - actual_cagr
-        
-        # Distribution coverage
-        coverage = calculate_distribution_coverage(actual_prices, all_forecast_paths)
-        
-        # Print results
-        print("\n" + "─" * 80)
-        print("PERFORMANCE METRICS")
-        print("─" * 80)
-        print(f"MAPE:                  {mape:.2f}%")
-        print(f"RMSE:                  ${rmse:,.2f}")
-        print(f"Directional Accuracy:  {directional_acc:.2f}%")
-        print(f"Actual CAGR:           {actual_cagr:.2f}%")
-        print(f"Forecast CAGR:         {forecast_cagr:.2f}%")
-        print(f"CAGR Error:            {cagr_error:+.2f}%")
-        print(f"Distribution Coverage: {coverage:.2f}%")
-        print("─" * 80)
-        print()
-        
-        # Return all data for aggregation and visualization
-        return {
-            'fold_idx': fold_idx,
-            'train_end': fold_config['train_end'],
-            'test_start': fold_config['test_start'],
-            'test_end': fold_config['test_end'],
-            'actual_horizon': actual_horizon,
-            'actual_prices': actual_prices,
-            'median_forecast': median_forecast,
-            'all_paths': all_forecast_paths,
-            'metrics': {
-                'mape': mape,
-                'rmse': rmse,
-                'directional_accuracy': directional_acc,
-                'actual_cagr': actual_cagr,
-                'forecast_cagr': forecast_cagr,
-                'cagr_error': cagr_error,
-                'coverage': coverage
-            }
-        }
-    
     except Exception as e:
-        print(f"✗ ERROR in fold {fold_idx + 1}: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return None
+        raise RuntimeError(
+            f"Fold {fold_idx + 1} failed during MarketSimulator.forecast_price() "
+            f"for period {fold_config['test_start']} to {fold_config['test_end']}"
+        ) from e
+
+    all_forecast_paths = extract_price_paths(forecast_result)
+
+    # Step 4: Calculate median forecast
+    median_forecast = all_forecast_paths.median(axis=1).values
+
+    # Step 5: Reconstruct actual prices from test data
+    print("[4/4] Calculating performance metrics...")
+    actual_prices = reconstruct_actual_prices(test_df)
+
+    # Step 6: Calculate all metrics
+    mape = calculate_mape(actual_prices, median_forecast)
+    rmse = calculate_rmse(actual_prices, median_forecast)
+    directional_acc = calculate_directional_accuracy(actual_prices, median_forecast)
+
+    # CAGR calculations
+    years = actual_horizon / 12.0  # Actual years covered
+    actual_cagr = calculate_cagr(actual_prices[0], actual_prices[-1], years)
+    forecast_cagr = calculate_cagr(median_forecast[0], median_forecast[-1], years)
+    cagr_error = forecast_cagr - actual_cagr
+
+    # Distribution coverage
+    coverage = calculate_distribution_coverage(actual_prices, all_forecast_paths)
+
+    # Print results
+    print("\n" + "─" * 80)
+    print("PERFORMANCE METRICS")
+    print("─" * 80)
+    print(f"MAPE:                  {mape:.2f}%")
+    print(f"RMSE:                  ${rmse:,.2f}")
+    print(f"Directional Accuracy:  {directional_acc:.2f}%")
+    print(f"Actual CAGR:           {actual_cagr:.2f}%")
+    print(f"Forecast CAGR:         {forecast_cagr:.2f}%")
+    print(f"CAGR Error:            {cagr_error:+.2f}%")
+    print(f"Distribution Coverage: {coverage:.2f}%")
+    print("─" * 80)
+    print()
+
+    # Return all data for aggregation and visualization
+    return {
+        'fold_idx': fold_idx,
+        'train_end': fold_config['train_end'],
+        'test_start': fold_config['test_start'],
+        'test_end': fold_config['test_end'],
+        'actual_horizon': actual_horizon,
+        'actual_prices': actual_prices,
+        'median_forecast': median_forecast,
+        'all_paths': all_forecast_paths,
+        'metrics': {
+            'mape': mape,
+            'rmse': rmse,
+            'directional_accuracy': directional_acc,
+            'actual_cagr': actual_cagr,
+            'forecast_cagr': forecast_cagr,
+            'cagr_error': cagr_error,
+            'coverage': coverage
+        }
+    }
 
 
 def aggregate_results(all_results):
@@ -305,11 +340,7 @@ def aggregate_results(all_results):
     print("OVERALL AGGREGATE STATISTICS")
     print("=" * 80)
     
-    valid_results = [r for r in all_results if r is not None]
-    
-    if not valid_results:
-        print("No valid results to aggregate.")
-        return
+    valid_results = all_results
     
     # Extract metrics
     mapes = [r['metrics']['mape'] for r in valid_results]
@@ -332,11 +363,7 @@ def visualize_results(all_results):
     print("GENERATING VISUALIZATION")
     print("=" * 80)
     
-    valid_results = [r for r in all_results if r is not None]
-    
-    if not valid_results:
-        print("No valid results to visualize.")
-        return
+    valid_results = all_results
     
     # Create 3x2 subplot grid
     fig, axes = plt.subplots(3, 2, figsize=(20, 18))
