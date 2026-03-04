@@ -50,9 +50,7 @@ class MarketSimulator:
             'Inflation_Rate_YoY',
             'Inflation_Rate_MoM',
             'National_Pop_Growth_YoY', 
-            'Municipal_Pop_Growth_YoY', 
-            'Migration_Rate', 
-            'NPR_Rate'
+            'Municipal_Pop_Growth_YoY'
         ]
 
         # --- TIER 2: The Financial & Labor Engine (Modeled via SARIMAX, Exog = Tier 1) ---
@@ -76,7 +74,9 @@ class MarketSimulator:
         self.tier3_vars = [
             'housing_starts_per_cap', 
             'under_construction_per_cap',
-            'completions_per_cap'
+            'completions_per_cap',
+            'Migration_Rate', 
+            'NPR_Rate'
         ]
 
         # Target variable is monthly log return (changed in processed_data)
@@ -107,9 +107,9 @@ class MarketSimulator:
         # Baseline + 20% optimism increase from neutral
         # Restores baseline, then adds subtle upward bias (0.1% monthly drift)
         # The "Steady Real Estate" Configuration
-        self.sentiment_shock_mean = 0.0001    # +0.1% monthly bias (~1.2% annualized upward drift)
-        self.sentiment_shock_std = 0.008     # 0.020 for realistic numbers
-        self.sentiment_mean_reversion = 0.25 # Shocks fade out quickly (prevents 10-year death spirals)
+        self.sentiment_shock_mean = 0.001    # +0.1% monthly bias (~1.2% annualized upward drift)
+        self.sentiment_shock_std = 0.002     # 0.020 for realistic numbers
+        self.sentiment_mean_reversion = 0.82 # Shocks fade out quickly (prevents 10-year death spirals)
 
     def fit(self, train_df: pd.DataFrame = None):
         """Fit all tiers: ARIMA (Tier 1), SARIMAX (Tier 2/3), XGBoost (Tier 4)."""
@@ -149,7 +149,7 @@ class MarketSimulator:
                 else:
                     model = pm.auto_arima(series, seasonal=False,
                                           error_action='ignore', suppress_warnings=True, 
-                                          stepwise=True, max_p=2, max_q=2, max_d=1,d=0,
+                                          stepwise=True, max_p=2, max_q=2, max_d=1,
                                           trace=False, n_jobs=-1)
                 self.arima_models[v] = model
                 tier1_success += 1
@@ -237,7 +237,7 @@ class MarketSimulator:
         # Use all columns from processed_data EXCEPT target/date and leakage-prone state trackers
         # Keep Affordability_Ratio_MoM in the dataframe for simulation/state updates,
         # but exclude it from model training features.
-        exclude_cols = {self.price_col, 'date', 'Affordability_Ratio_MoM','Affordability_Ratio_MoM_delta_3', 'Affordability_Ratio_MoM_delta_12', 'Affordability_Ratio_MoM_lag_1', 'Affordability_Ratio_MoM_lag_3', 'Affordability_Ratio_MoM_RA_12', 'Affordability_Ratio_MoM_RA_24', 'Log_Return_MoM_RA_3', 'Log_Return_MoM_lag_1', 'Log_Return_MoM_lag_3', 'Log_Return_MoM_lag_6', 'Log_Return_MoM_lag_12', 'Affordability_Deviation_lag_1', 'Affordability_Deviation_lag_3', 'Affordability_Deviation_delta_3','Affordability_Deviation'}
+        exclude_cols = {self.price_col, 'date', 'Affordability_Ratio_MoM', 'Affordability_Ratio_MoM_delta_12', 'Affordability_Ratio_MoM_lag_1', 'Affordability_Ratio_MoM_lag_3', 'Affordability_Ratio_MoM_RA_12', 'Affordability_Ratio_MoM_RA_24', 'Log_Return_MoM_RA_3', 'Log_Return_MoM_lag_1', 'Log_Return_MoM_lag_3', 'Log_Return_MoM_lag_6', 'Log_Return_MoM_lag_12', 'Affordability_Deviation_lag_1', 'Affordability_Deviation_lag_3', 'Affordability_Deviation_delta_3','Affordability_Deviation'}
         feature_cols = [c for c in train_df.columns if c not in exclude_cols]
         
         # Drop rows where target is NaN
@@ -359,6 +359,19 @@ class MarketSimulator:
             tier1_sim.iloc[month_idx, tier1_sim.columns.get_loc('GDP_Growth_YoY')] = -0.03
             
 
+        def _get_idiosyncratic_volatility(model, fallback_std: float) -> float:
+            """Estimate forecast volatility from model MSE, with robust fallback."""
+            try:
+                mse_attr = getattr(model, 'mse', None)
+                if mse_attr is not None:
+                    mse_value = float(np.nanmean(np.asarray(mse_attr, dtype=float)))
+                    if np.isfinite(mse_value) and mse_value > 0:
+                        return float(np.sqrt(mse_value))
+            except Exception:
+                pass
+            return float(fallback_std)
+
+
 
         # --- Tier 2 Simulation (SARIMAX forecast) ---
         tier2_sim = pd.DataFrame(index=future_index)
@@ -372,7 +385,9 @@ class MarketSimulator:
             if model:
                 try:
                     pred = model.get_forecast(steps=steps, exog=exog_tier1).predicted_mean
-                    tier2_sim[v] = pred.values
+                    volatility = _get_idiosyncratic_volatility(model, fallback_std=0.5)
+                    idiosyncratic_shocks = np.random.normal(0, volatility * 1.5, size=steps)
+                    tier2_sim[v] = pred.values + idiosyncratic_shocks
                 except Exception as e:
                     tier2_forecast_failures.append(f"{v}: {str(e)[:40]}")
                     # Deterministic fallback based only on historical trajectory
@@ -398,7 +413,9 @@ class MarketSimulator:
             if model:
                 try:
                     pred = model.get_forecast(steps=steps, exog=exog_combined[valid_exog_cols]).predicted_mean
-                    tier3_sim[v] = pred.values
+                    volatility = _get_idiosyncratic_volatility(model, fallback_std=0.3)
+                    idiosyncratic_shocks = np.random.normal(0, volatility * 1.2, size=steps)
+                    tier3_sim[v] = pred.values + idiosyncratic_shocks
                 except Exception as e:
                     tier3_forecast_failures.append(f"{v}: {str(e)[:40]}")
                     # Deterministic fallback based only on historical trajectory
