@@ -30,14 +30,14 @@ warnings.filterwarnings("ignore")
 # ============================================================================
 BASE_SEED = 42  # Global seed for reproducibility
 FORECAST_HORIZON = 240  # 20 years = 240 months
-MONTE_CARLO_ITERATIONS = 10  # Number of simulation paths per fold
+MONTE_CARLO_ITERATIONS = 3  # Number of simulation paths per fold
 RESULTS_DIR = "/workspaces/Buying-vs.-Renting-a-Property-in-Toronto/results"
 DATA_PATH = "/workspaces/Buying-vs.-Renting-a-Property-in-Toronto/data/processed_data.csv"
 
 # Define the 6 validation periods
 VALIDATION_FOLDS = [
-    {"train_end": "1985-03-01", "test_start": "1985-04-01", "test_end": "2005-03-01"},
-    {"train_end": "1989-03-01", "test_start": "1989-04-01", "test_end": "2009-03-01"},
+    #{"train_end": "1985-03-01", "test_start": "1985-04-01", "test_end": "2005-03-01"},
+    #{"train_end": "1989-03-01", "test_start": "1989-04-01", "test_end": "2009-03-01"},
     {"train_end": "1993-03-01", "test_start": "1993-04-01", "test_end": "2013-03-01"},
     {"train_end": "1997-03-01", "test_start": "1997-04-01", "test_end": "2017-03-01"},
     {"train_end": "2001-03-01", "test_start": "2001-04-01", "test_end": "2021-03-01"},

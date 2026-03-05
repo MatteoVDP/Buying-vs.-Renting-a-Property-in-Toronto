@@ -93,7 +93,7 @@ class MarketSimulator:
         
         # --- 3. EXTREME EVENT CONFIGURATION ---
         # Noise reduction for Tier 1 variables (macro indicators)
-        self.tier1_noise_scale = 1.0  # 2% residual noise for realistic variation
+        self.tier1_noise_scale = 4.0  # 2% residual noise for realistic variation
         
         # Refined Black Swan: Lower probability, moderate impact, auto-recovery
         self.black_swan_prob = 0  # Disabled - use only model dynamics
@@ -107,9 +107,9 @@ class MarketSimulator:
         # Baseline + 20% optimism increase from neutral
         # Restores baseline, then adds subtle upward bias (0.1% monthly drift)
         # The "Steady Real Estate" Configuration
-        self.sentiment_shock_mean = 0.001    # +0.1% monthly bias (~1.2% annualized upward drift)
-        self.sentiment_shock_std = 0.002     # 0.020 for realistic numbers
-        self.sentiment_mean_reversion = 0.82 # Shocks fade out quickly (prevents 10-year death spirals)
+        self.sentiment_shock_mean = 0.000    # +0.1% monthly bias (~1.2% annualized upward drift)
+        self.sentiment_shock_std = 0.005     # 0.020 for realistic numbers
+        self.sentiment_mean_reversion = 0.75 # Shocks fade out quickly (prevents 10-year death spirals)
 
     def fit(self, train_df: pd.DataFrame = None):
         """Fit all tiers: ARIMA (Tier 1), SARIMAX (Tier 2/3), XGBoost (Tier 4)."""
@@ -256,7 +256,7 @@ class MarketSimulator:
         
         if XGBRegressor:
             self.xgb_model = XGBRegressor(n_estimators=self.xgb_n_estimators, learning_rate=self.xgb_learning_rate, #reg_lambda=20.0,
-            max_depth=3, subsample=0.7, colsample_bytree=0.7,n_jobs=-1, random_state=self.seed, verbosity=0)
+            max_depth=5, subsample=0.7, colsample_bytree=0.7,n_jobs=-1, random_state=self.seed, verbosity=0)
             self.xgb_model.fit(X, y)
         
         print("Training Complete.")
