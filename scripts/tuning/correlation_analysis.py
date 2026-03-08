@@ -26,6 +26,6 @@ plt.close()
 
 print("Correlation heatmap saved to correlation_heatmap.png")
 
-# Optional: To see the correlations with the target variable "Log_Price" more clearly
-print("\nCorrelations with Log_Price:")
-print(correlation_matrix['Log_Price'].sort_values(ascending=False))
+# Optional: To see the correlations with the target variable "Log_Return_MoM" more clearly
+print("\nCorrelations with Log_Return_MoM:")
+print(correlation_matrix['Log_Return_MoM'].sort_values(ascending=False))

@@ -1,0 +1,95 @@
+================================================================================
+25-YEAR MARKET FORECAST: MARCH 2025 - MARCH 2050
+================================================================================
+
+1. Loading historical market data...
+   Historical data: 675 rows
+   Date range: January 1969 to March 2025
+
+2. Initializing MarketSimulator with seed=42...
+
+3. Fitting ARIMA/SARIMAX/XGBoost models on historical data...
+/usr/local/python/3.12.1/lib/python3.12/site-packages/statsmodels/base/model.py:607: ConvergenceWarning: Maximum Likelihood optimization failed to converge. Check mle_retvals
+  warnings.warn("Maximum Likelihood optimization failed to "
+/usr/local/python/3.12.1/lib/python3.12/site-packages/statsmodels/base/model.py:607: ConvergenceWarning: Maximum Likelihood optimization failed to converge. Check mle_retvals
+  warnings.warn("Maximum Likelihood optimization failed to "
+/usr/local/python/3.12.1/lib/python3.12/site-packages/statsmodels/base/model.py:607: ConvergenceWarning: Maximum Likelihood optimization failed to converge. Check mle_retvals
+  warnings.warn("Maximum Likelihood optimization failed to "
+/usr/local/python/3.12.1/lib/python3.12/site-packages/statsmodels/base/model.py:607: ConvergenceWarning: Maximum Likelihood optimization failed to converge. Check mle_retvals
+  warnings.warn("Maximum Likelihood optimization failed to "
+/usr/local/python/3.12.1/lib/python3.12/site-packages/statsmodels/base/model.py:607: ConvergenceWarning: Maximum Likelihood optimization failed to converge. Check mle_retvals
+  warnings.warn("Maximum Likelihood optimization failed to "
+Fitting Tier 1 (ARIMA)...
+    ✓ GDP_Growth_YoY 
+    ✓ most_recent_quarterly_gdp_%_change_extended 
+    ✓ Inflation_Rate_YoY 
+    ✓ Inflation_Rate_MoM 
+    ✓ National_Pop_Growth_YoY 
+    ✓ Municipal_Pop_Growth_YoY 
+    ✓ Migration_Rate (seasonal)
+    ✓ NPR_Rate (seasonal)
+  ✓ Tier 1: 8/8 models fitted successfully
+Fitting Tier 2 & 3 (SARIMAX)...
+  ✓ Tier 2: 11/11 models fitted successfully
+  ✓ Tier 3: 3/3 models fitted successfully
+Fitting Tier 4 (XGBoost)...
+  XGBoost: 95 features, 675 samples
+Training Complete.
+   ✓ Models fitted successfully
+
+4. Generating 25-year (300-month) forecast...
+   Running 1 Monte Carlo iteration x 300 months...
+
+5. Generating exogenous variables for forecast period...
+   ✓ Forecast horizon: 300 months
+   Forecast period: April 2025 to March 2050
+
+6. Predicting Log_Return_MoM and converting to real prices...
+
+7. Combining historical and forecast data...
+   Total rows: 975
+   Total columns: 101
+   Date range: January 1969 to March 2050
+
+7. Saving complete forecast to results/forecast_25_year_march2050.csv...
+   ✓ Saved 975 rows × 101 columns
+
+8. Creating price path visualization...
+   Saving visualization to results/forecast_25_year_march2050.png...
+   ✓ Saved
+
+10. Forecast Summary Statistics:
+   ============================================================================
+   Initial Price (Start of Forecast): $1,088,477.86
+   Final Price (March 2050):          $144,623.47
+   Lowest Price:                      $144,509.72
+   Highest Price:                     $1,088,477.86
+   Mean Price:                        $485,899.57
+
+   Total 25-Year Change:              -86.71%
+   Average Annual Growth Rate:        -7.76%
+
+   Monthly Returns - Mean:            -0.672%
+   Monthly Returns - Std Dev:         0.424%
+   Monthly Returns - Min:             -2.286%
+   Monthly Returns - Max:             +1.649%
+   ============================================================================
+
+================================================================================
+FORECAST GENERATION COMPLETE
+================================================================================
+
+Outputs:
+  1. Complete CSV: results/forecast_25_year_march2050.csv
+     - 975 rows (historical + forecast)
+     - All exogenous variables filled for forecast period
+     - Price projections from March 2025 to March 2050
+
+  2. Visualization: results/forecast_25_year_march2050.png
+     - Monthly price path with confidence visual
+     - Monthly percent changes
+
+Recommended next steps:
+  - Review CSV in Excel for detailed month-by-month data
+  - Open PNG to visualize the forecast trajectory
+  - Compare with multiple iterations if desired

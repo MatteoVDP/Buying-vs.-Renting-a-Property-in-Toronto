@@ -30,6 +30,7 @@ cols_to_smooth = [
     'national_pop',
     'provincial_pop',
     'municipal_pop',
+    'sales_volume',
     'national_gdp_real,_seasonally_adjusted',
     'provincial_gdp_real,_seasonally_adjusted',
     'national_gdp_nominal',
@@ -53,21 +54,20 @@ for col in cols_to_smooth:
     else:
         print(f"Warning: Column '{col}' not found in dataframe.")
 
-# Target: Month-over-Month Log Return (change in log price)
-# Compute directly without creating a persistent `Log_Price` column
-price_col = 'market_price_target_average,_detached_single_family_homes'
-if price_col in df.columns:
-    df['Log_Return_MoM'] = np.log(df[price_col]).diff()
-else:
-    df['Log_Return_MoM'] = 0.0
+#modifying features to allow for XGB to best use them
+
+df['Log_Price'] = np.log(df['market_price_target_average,_detached_single_family_homes'])
+df['Log_Return_MoM'] = df['Log_Price'].diff()
+df['sales_volume_MoM'] = df['sales_volume'].pct_change(1)
+df['sales_volume_YoY'] = df['sales_volume'].pct_change(12)
 
 df['GDP_Growth_YoY'] = df['national_gdp_real,_seasonally_adjusted'].pct_change(12)
 df['National_Pop_Growth_YoY'] = df['national_pop'].pct_change(12)
-df['Provincial_Pop_Growth_YoY'] = df['provincial_pop'].pct_change(12)
+#df['Provincial_Pop_Growth_YoY'] = df['provincial_pop'].pct_change(12)
 df['Municipal_Pop_Growth_YoY'] = df['municipal_pop'].pct_change(12)
+df['Inflation_Rate_MoM'] = df['cpi___national,_all_products'].pct_change(1)
 df['Inflation_Rate_YoY'] = df['cpi___national,_all_products'].pct_change(12)
 df['Labour_Force_Growth_YoY'] = df['total_labour_force_size_people_15_or_over,_employed_or_actively_seeking_work'].pct_change(12)
-df['Inflation_Rate'] = df['cpi___national,_core'].pct_change(12)
 df['Income_Growth_YoY'] = df['median_income_per_household_in_toronto'].pct_change(12)
 
 df['Migration_Rate'] = (df['ontario_net_interprovincial_migration_monthly'] + df['ontario_net_international_migration_monthly'] - df['ontario_net_non_permanent_residents'])/df['provincial_pop']
@@ -79,74 +79,63 @@ df['completions_per_cap'] = df['completions__sfh,_monthly']/df['municipal_pop']
 df['month_sin'] = np.sin(2*np.pi*df['month']/12)
 df['month_cos'] = np.cos(2*np.pi*df['month']/12)
 
-df['Ratio_Current_1'] = df['market_price_target_average,_detached_single_family_homes'] / df['median_income_per_household_in_toronto']
-df['Affordability_Ratio_Lag1'] = df['Ratio_Current_1'].shift(1)
-df['Ratio_Current_12'] = df['market_price_target_average,_detached_single_family_homes'] / df['median_income_per_household_in_toronto']
-df['Affordability_Ratio_Lag12'] = df['Ratio_Current_12'].shift(12)
+df['Affordability_Ratio'] = df['market_price_target_average,_detached_single_family_homes'] / df['median_income_per_household_in_toronto']
+df.columns
 
-# --- 1. DEFINE TARGET VARIABLE (The Delta Strategy) ---
-# We predict the Month-over-Month Log Return (Change in Log Price)
-# diff() on a log variable = Log Return
-df['Log_Return_MoM'] = df['Log_Price'].diff()
-df['Log_Return_MoM'] = df['Log_Return_MoM'].fillna(0) # Handle first row NaN
-
-# --- 2. FEATURE ENGINEERING ---
 new_features = []
 
-# --- A. PRICE GROUP (Split to handle Log vs Real logic) ---
-# 1. Real Market Price (Use Pct Change)
-col = 'market_price_target_average,_detached_single_family_homes'
-if col in df.columns:
+fe_rates = ['3_month_t_bill', '5y_bond',
+       'yield_curve_slope', 'variable_mortgage_rate', '5_year_fixed_mortgage_qualifying_rate'] # delta 1, 3, 6, 12
+
+fe_YoY = ['GDP_Growth_YoY',
+       'National_Pop_Growth_YoY', #'Provincial_Pop_Growth_YoY',
+       'Municipal_Pop_Growth_YoY', 'Inflation_Rate_YoY',
+       'Labour_Force_Growth_YoY', 'Income_Growth_YoY'] #lag 6 - RA 12
+       
+fe_immigration = ['Migration_Rate', 'NPR_Rate'] #lag 6, 12 - delta 6, 12 - RA 12
+
+fe_target = ['Log_Return_MoM'] #lag 1, 3, 6, 12 TARGET
+
+fe_sales_volume = ['sales_volume_MoM', 'sales_volume_YoY'] #lag 1, 3, 12 DROP
+
+fe_affordability = ['Affordability_Ratio'] #lag 6, 12 - delta 6, 12 - RA 12
+
+fe_supply = ['housing_starts_per_cap', 'under_construction_per_cap', 'completions_per_cap'] #lag 12, 24 - RA 6, 12
+
+for col in [c for c in fe_rates if c in df.columns]:
+    for m in [1, 3, 6, 12]:
+        new_features.append(df[col].diff(m).rename(f"{col}_delta_{m}"))
+
+for col in [c for c in fe_YoY if c in df.columns]:
+    new_features.append(df[col].shift(6).rename(f"{col}_lag_6"))
+    new_features.append(df[col].rolling(window=12).mean().rename(f"{col}_RA_12"))
+
+for col in [c for c in fe_immigration if c in df.columns]:
+    new_features.append(df[col].rolling(window=12).mean().rename(f"{col}_RA_12"))
+    for m in [6, 12]:
+        new_features.append(df[col].shift(m).rename(f"{col}_lag_{m}"))
+        new_features.append(df[col].diff(m).rename(f"{col}_delta_{m}"))
+
+for col in [c for c in fe_target if c in df.columns]:
     for m in [1, 3, 6, 12]:
         new_features.append(df[col].shift(m).rename(f"{col}_lag_{m}"))
-    for m in [1, 12]:
-        new_features.append(df[col].pct_change(m).rename(f"{col}_delta_{m}m_pct"))
 
-# 2. Log Price (Use Diff, NOT Pct Change) & Log Returns (Momentum)
-# MOMENTUM FEATURES (Lags of the Target Log Returns)
-for m in [1, 3, 6, 12]:
-    new_features.append(df['Log_Return_MoM'].shift(m).rename(f"Log_Return_MoM_lag_{m}"))
-
-# --- B. MACRO GROUP ---
-macro_cols = [
-    'national_pop', 'provincial_pop', 'municipal_pop',
-    'national_gdp_real,_seasonally_adjusted', 'provincial_gdp_real,_seasonally_adjusted',
-    'median_income_per_household_in_toronto', 'cpi___national,_all_products', 'cpi___national,_core'
-]
-for col in [c for c in macro_cols if c in df.columns]:
-    new_features.append(df[col].shift(12).rename(f"{col}_lag_12"))
-    new_features.append(df[col].pct_change(12).rename(f"{col}_delta_12m_pct"))
-
-# --- C. FINANCIALS GROUP (Rates use Diff) ---
-fin_cols = [
-    '3_month_t_bill', '2y_bond', '5y_bond', '10y_bond', 
-    'variable_mortgage_rate', '5_year_fixed_mortgage_rate', 
-    '5_year_fixed_mortgage_qualifying_rate', 'yield_curve_slope'
-]
-for col in [c for c in fin_cols if c in df.columns]:
-    for m in [1, 3]:
+for col in [c for c in fe_sales_volume if c in df.columns]:
+    for m in [1, 3, 12]:
         new_features.append(df[col].shift(m).rename(f"{col}_lag_{m}"))
-        new_features.append(df[col].diff(m).rename(f"{col}_delta_{m}m_diff"))
 
-# --- D. SUPPLY GROUP ---
-supply_cols = [
-    'housing_starts_sfh,_monthly', 'under_construction_sfh,_monthly', 
-    'completions__sfh,_monthly', 'sales_volume'
-]
-for col in [c for c in supply_cols if c in df.columns]:
-    new_features.append(df[col].shift(12).rename(f"{col}_lag_12"))
-    new_features.append(df[col].pct_change(12).rename(f"{col}_delta_12m_pct"))
-
-# --- E. MIGRATION GROUP ---
-migration_cols = [
-    'ontario_net_international_migration_monthly', 
-    'ontario_net_interprovincial_migration_monthly',
-    'ontario_net_non_permanent_residents'
-]
-for col in [c for c in migration_cols if c in df.columns]:
-    for m in [1, 12]:
+for col in [c for c in fe_affordability if c in df.columns]:
+    new_features.append(df[col].rolling(window=12).mean().rename(f"{col}_RA_12"))
+    new_features.append(df[col].rolling(window=24).mean().rename(f"{col}_RA_24"))
+    for m in [3, 12]:
         new_features.append(df[col].shift(m).rename(f"{col}_lag_{m}"))
-    new_features.append(df[col].pct_change(12).rename(f"{col}_delta_12m_pct"))
+        new_features.append(df[col].diff(m).rename(f"{col}_delta_{m}"))
+
+for col in [c for c in fe_supply if c in df.columns]:
+    new_features.append(df[col].shift(12).rename(f"{col}_lag_12"))
+    new_features.append(df[col].shift(24).rename(f"{col}_lag_24"))
+    new_features.append(df[col].rolling(window=6).mean().rename(f"{col}_RA_6"))
+    new_features.append(df[col].rolling(window=12).mean().rename(f"{col}_RA_12"))
 
 # --- 3. MERGE & CLEANUP ---
 # Concat all new features
@@ -161,8 +150,9 @@ df.replace([np.inf, -np.inf], 0, inplace=True)
 
 # Define the list of columns to drop
 columns_to_drop = [
-    # Original target variable (we now have Log_Price)
+    # Original target variable (we now use Log_Return_MoM)
     'market_price_target_average,_detached_single_family_homes',
+    'Log_Price',
     
     # Original columns used for Year-over-Year growth features
     'national_gdp_real,_seasonally_adjusted',
@@ -174,6 +164,8 @@ columns_to_drop = [
     'id',
     'temp',
     'sales_volume',
+    'sales_volume_MoM',
+    'sales_volume_YoY',
     'year',
     'month',
     'provincial_gdp_real,_seasonally_adjusted',
@@ -182,8 +174,6 @@ columns_to_drop = [
     'gdp_per_cap_real',
     'national_debt_billions',
     'provincial_debt',
-    'Ratio_Current_1',
-    'Ratio_Current_12',
     'ontario_net_interprovincial_migration_monthly',
     'ontario_net_international_migration_monthly',
     'ontario_net_non_permanent_residents',
@@ -192,14 +182,16 @@ columns_to_drop = [
     'completions__sfh,_monthly',
     'median_income_per_household_in_toronto',
     'cpi___national,_all_products', 
-    'cpi___national,_core'
-    
+    'cpi___national,_core',
+    '2y_bond',
+    '10y_bond', 
+    '5_year_fixed_mortgage_rate'
 ]
 
 # Drop the specified columns from the dataframe
 df.drop(columns=columns_to_drop, inplace=True, axis=1)
 
 #drop indices that have NaNs from lag, delta, and average features
-df.drop(df.index[0:12], inplace=True)
+df.drop(df.index[0:24], inplace=True)
 
 df.to_csv("data/processed_data.csv", index=True)

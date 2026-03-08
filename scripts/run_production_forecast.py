@@ -22,6 +22,32 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from market_simulator import MarketSimulator
 
 
+def _extract_price_paths(forecast_result) -> pd.DataFrame:
+    """Normalize forecast output to a non-empty DataFrame of price paths."""
+    price_paths = forecast_result.get('price_paths') if isinstance(forecast_result, dict) else forecast_result
+    if not isinstance(price_paths, pd.DataFrame):
+        raise TypeError(
+            f"forecast_price() must return DataFrame or dict with DataFrame 'price_paths', got {type(price_paths)}"
+        )
+    if price_paths.empty:
+        raise ValueError("forecast_price() produced an empty price_paths DataFrame")
+    return price_paths
+
+
+def _rebuild_prices_from_log_returns(log_returns: pd.Series, terminal_price: float) -> pd.Series:
+    """Rebuild a level price path from monthly log returns and a terminal anchor price."""
+    returns = pd.to_numeric(log_returns, errors='coerce').fillna(0.0).to_numpy(dtype=float)
+    if len(returns) == 0:
+        return pd.Series(dtype=float)
+
+    log_prices = np.empty(len(returns), dtype=float)
+    log_prices[-1] = float(np.log(terminal_price))
+    for i in range(len(returns) - 2, -1, -1):
+        log_prices[i] = log_prices[i + 1] - float(returns[i + 1])
+
+    return pd.Series(np.exp(log_prices), index=log_returns.index)
+
+
 def load_historical_data(data_path: str) -> pd.DataFrame:
     """Load the full historical dataset."""
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Loading historical data from {data_path}...")
@@ -30,11 +56,11 @@ def load_historical_data(data_path: str) -> pd.DataFrame:
     return df
 
 
-def initialize_simulator(df: pd.DataFrame, seed: int = 42) -> MarketSimulator:
+def initialize_simulator(df: pd.DataFrame, seed: int = 42, start_market_price: float = 1090326.0) -> MarketSimulator:
     """Initialize the MarketSimulator with seed."""
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Initializing MarketSimulator (seed={seed})...")
     # Use the last known market price from March 2025 as reference
-    simulator = MarketSimulator(df, seed=seed, start_market_price=1090326.0)
+    simulator = MarketSimulator(df, seed=seed, start_market_price=start_market_price)
     return simulator
 
 
@@ -59,7 +85,8 @@ def run_monte_carlo_simulation(simulator: MarketSimulator, steps: int = 300, ite
     print(f"[{sim_start.strftime('%Y-%m-%d %H:%M:%S')}] Running {iterations} iterations over {steps} months (25 years)...")
     
     # Run the multiverse simulation
-    price_paths = simulator.forecast_price(steps=steps, iterations=iterations)
+    forecast_result = simulator.forecast_price(steps=steps, iterations=iterations)
+    price_paths = _extract_price_paths(forecast_result)
     
     sim_end = datetime.now()
     sim_duration = (sim_end - sim_start).total_seconds()
@@ -91,8 +118,9 @@ def aggregate_statistics(price_paths: pd.DataFrame) -> pd.DataFrame:
     return summary_stats_df
 
 
-def create_fan_chart(price_paths: pd.DataFrame, summary_stats_df: pd.DataFrame, 
-                     df_historical: pd.DataFrame, output_path: str) -> None:
+def create_fan_chart(price_paths: pd.DataFrame, summary_stats_df: pd.DataFrame,
+                     df_historical: pd.DataFrame, output_path: str,
+                     anchor_price: float = 1090326.0) -> None:
     """Create and save the fan chart visualization with historical data from 1968 and forecast to 2050."""
     viz_start = datetime.now()
     print(f"[{viz_start.strftime('%Y-%m-%d %H:%M:%S')}] === VISUALIZATION PHASE STARTED ===")
@@ -100,10 +128,16 @@ def create_fan_chart(price_paths: pd.DataFrame, summary_stats_df: pd.DataFrame,
     
     # Extract historical prices and dates
     historical_dates = pd.to_datetime(df_historical['date'])
-    
-    # Use the market_price_target_average column (lag_1 is the most recent price)
-    # Calculate actual prices from log prices using exponential transformation
-    historical_prices = np.exp(df_historical['Log_Price_lag_1'].astype(float))
+
+    if 'Log_Return_MoM' not in df_historical.columns:
+        raise ValueError("Historical dataset must include 'Log_Return_MoM' to rebuild prices.")
+
+    historical_prices = _rebuild_prices_from_log_returns(df_historical['Log_Return_MoM'], anchor_price)
+    historical_prices = historical_prices.replace([np.inf, -np.inf], np.nan).ffill().bfill()
+    if historical_prices.isna().all():
+        raise ValueError("Historical price series could not be constructed (all values are NaN)")
+
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Historical price source: Log_Return_MoM (reconstructed)")
     
     # Get the last historical date for reference
     last_historical_date = historical_dates.iloc[-1]
@@ -113,10 +147,6 @@ def create_fan_chart(price_paths: pd.DataFrame, summary_stats_df: pd.DataFrame,
     # From 2025-03 to 2050-03 is 25 years or 300 months
     forecast_dates = [last_historical_date + relativedelta(months=i) for i in range(1, len(summary_stats_df) + 1)]
     forecast_dates = pd.to_datetime(forecast_dates)
-    
-    # Create combined timeline
-    combined_dates = pd.concat([pd.Series(historical_dates), pd.Series(forecast_dates)])
-    combined_dates.reset_index(drop=True, inplace=True)
     
     # Extend price_paths and summary_stats_df indices to match combined dates
     price_paths_with_dates = price_paths.copy()
@@ -131,10 +161,15 @@ def create_fan_chart(price_paths: pd.DataFrame, summary_stats_df: pd.DataFrame,
     ax.plot(historical_dates, historical_prices, 
             color='darkblue', linewidth=2.5, label='Historical (1968-2025)', zorder=10)
     
-    # Plot all simulation paths with high transparency
+    # Plot all Monte Carlo paths as visible light-gray traces (match validation output style)
     for col in price_paths_with_dates.columns:
-        ax.plot(forecast_dates, price_paths_with_dates[col], 
-                color='lightgray', alpha=0.02, linewidth=0.5)
+        ax.plot(
+            forecast_dates,
+            price_paths_with_dates[col],
+            color='gray',
+            alpha=0.3,
+            linewidth=0.8,
+        )
     
     # Overlay percentile lines for forecast with bold, distinct colors
     
@@ -217,6 +252,7 @@ def main():
     # Configuration
     data_path = "/workspaces/Buying-vs.-Renting-a-Property-in-Toronto/data/processed_data.csv"
     results_dir = "/workspaces/Buying-vs.-Renting-a-Property-in-Toronto/results"
+    start_market_price = 1090326.0
     
     paths_output = os.path.join(results_dir, "final_simulations.csv")
     stats_output = os.path.join(results_dir, "final_summary_stats.csv")
@@ -231,19 +267,19 @@ def main():
     df = load_historical_data(data_path)
     
     # Stage 2: Initialize Simulator
-    simulator = initialize_simulator(df, seed=42)
+    simulator = initialize_simulator(df, seed=42, start_market_price=start_market_price)
     
     # Stage 3: Train Master Model
     train_master_model(simulator, df)
     
     # Stage 4: Run Monte Carlo Simulation
-    price_paths = run_monte_carlo_simulation(simulator, steps=300, iterations=3)
+    price_paths = run_monte_carlo_simulation(simulator, steps=300, iterations=20)
     
     # Stage 5: Aggregate Statistics
     summary_stats_df = aggregate_statistics(price_paths)
     
     # Stage 6: Create Fan Chart (with historical data)
-    create_fan_chart(price_paths, summary_stats_df, df, plot_output)
+    create_fan_chart(price_paths, summary_stats_df, df, plot_output, anchor_price=start_market_price)
     
     # Stage 7: Export Results
     export_results(price_paths, summary_stats_df, paths_output, stats_output)
