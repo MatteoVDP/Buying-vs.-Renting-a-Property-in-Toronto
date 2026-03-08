@@ -6,12 +6,12 @@ The project combines macroeconomic simulation, feature-engineered machine learni
 
 ## Project Goals
 
-- Forecast housing market trajectories over long horizons (typically 25 years / 300 months).
+- Forecast housing market trajectories over 25 year horizon.
 - Capture uncertainty with Monte Carlo simulation rather than single-point predictions.
 - Model interactions between macro drivers, financing conditions, housing supply, and price returns.
 - Compare simulated housing outcomes to a renter-investor portfolio baseline.
 
-## Current Snapshot (March 2026)
+## Project Overview
 
 - Core dataset: `data/processed_data.csv`
 - Dataset shape: 675 rows x 97 columns
