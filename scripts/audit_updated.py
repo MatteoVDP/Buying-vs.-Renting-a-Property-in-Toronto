@@ -67,7 +67,7 @@ def run_25_year_forecast():
     print(f"   This uses the full 4-tier model (ARIMA/SARIMAX/XGBoost + sentiment)...")
     
     # Run 1 iteration with 300 months
-    forecast_result = sim.forecast_price(iterations=1, steps=steps)
+    forecast_result = sim.forecast_price(iterations=3, steps=steps)
     
     # Extract price paths and full feature history
     price_paths = forecast_result['price_paths']
