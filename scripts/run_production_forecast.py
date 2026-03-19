@@ -22,6 +22,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from market_simulator import MarketSimulator
 
 
+TARGET_DATE = "2050-03-01"
+TARGET_PRICE_THRESHOLD = 5_590_000.0
+
+
 def _extract_price_paths(forecast_result) -> pd.DataFrame:
     """Normalize forecast output to a non-empty DataFrame of price paths."""
     price_paths = forecast_result.get('price_paths') if isinstance(forecast_result, dict) else forecast_result
@@ -116,6 +120,210 @@ def aggregate_statistics(price_paths: pd.DataFrame) -> pd.DataFrame:
     print(f"[{agg_end.strftime('%Y-%m-%d %H:%M:%S')}] Aggregation complete in {agg_duration:.2f} seconds\n")
     
     return summary_stats_df
+
+
+def build_terminal_performance_stats(
+    price_paths: pd.DataFrame,
+    target_date: str = TARGET_DATE,
+    threshold_price: float = TARGET_PRICE_THRESHOLD,
+) -> pd.DataFrame:
+    """Create one-row terminal performance stats from the final forecast month."""
+    if price_paths.empty:
+        raise ValueError("Cannot build terminal performance stats from empty price_paths")
+
+    terminal_prices = pd.to_numeric(price_paths.iloc[-1], errors='coerce').dropna()
+    if terminal_prices.empty:
+        raise ValueError("Terminal forecast row contains no valid numeric values")
+
+    simulation_count = int(terminal_prices.shape[0])
+    threshold_diff = terminal_prices - threshold_price
+
+    bear_10th = float(terminal_prices.quantile(0.10))
+    p25 = float(terminal_prices.quantile(0.25))
+    median_50th = float(terminal_prices.quantile(0.50))
+    p75 = float(terminal_prices.quantile(0.75))
+    bull_90th = float(terminal_prices.quantile(0.90))
+    mean_price = float(terminal_prices.mean())
+    std_dev = float(terminal_prices.std(ddof=1)) if simulation_count > 1 else 0.0
+    absolute_min = float(terminal_prices.min())
+    absolute_max = float(terminal_prices.max())
+
+    count_strictly_gt_threshold = int((terminal_prices > threshold_price).sum())
+    count_at_or_above_threshold = int((terminal_prices >= threshold_price).sum())
+    count_strictly_lt_threshold = int((terminal_prices < threshold_price).sum())
+    count_at_or_below_threshold = int((terminal_prices <= threshold_price).sum())
+
+    overshoot_values = threshold_diff[threshold_diff > 0]
+    shortfall_values = -threshold_diff[threshold_diff <= 0]
+    mean_overshoot_if_gt = float(overshoot_values.mean()) if not overshoot_values.empty else 0.0
+    max_overshoot_if_gt = float(overshoot_values.max()) if not overshoot_values.empty else 0.0
+    mean_shortfall_if_le = float(shortfall_values.mean()) if not shortfall_values.empty else 0.0
+    max_shortfall_if_le = float(shortfall_values.max()) if not shortfall_values.empty else 0.0
+
+    terminal_stats_df = pd.DataFrame(
+        [
+            {
+                'Target_Date': target_date,
+                'Forecast_Horizon_Months': int(price_paths.shape[0]),
+                'Simulation_Count': simulation_count,
+                'Bear_10th': bear_10th,
+                'P25': p25,
+                'Median_50th': median_50th,
+                'P75': p75,
+                'Bull_90th': bull_90th,
+                'Mean': mean_price,
+                'Std_Dev': std_dev,
+                'IQR_P75_minus_P25': float(p75 - p25),
+                'Absolute_Min': absolute_min,
+                'Absolute_Max': absolute_max,
+                'Threshold_Price': float(threshold_price),
+                'Count_Strictly_GT_Threshold': count_strictly_gt_threshold,
+                'Share_Strictly_GT_Threshold': float(count_strictly_gt_threshold / simulation_count),
+                'Count_At_Or_Above_Threshold': count_at_or_above_threshold,
+                'Share_At_Or_Above_Threshold': float(count_at_or_above_threshold / simulation_count),
+                'Count_Strictly_LT_Threshold': count_strictly_lt_threshold,
+                'Share_Strictly_LT_Threshold': float(count_strictly_lt_threshold / simulation_count),
+                'Count_At_Or_Below_Threshold': count_at_or_below_threshold,
+                'Share_At_Or_Below_Threshold': float(count_at_or_below_threshold / simulation_count),
+                'Mean_Deviation_From_Threshold': float(mean_price - threshold_price),
+                'Median_Deviation_From_Threshold': float(median_50th - threshold_price),
+                'Bear_10th_Deviation_From_Threshold': float(bear_10th - threshold_price),
+                'Bull_90th_Deviation_From_Threshold': float(bull_90th - threshold_price),
+                'Absolute_Min_Deviation_From_Threshold': float(absolute_min - threshold_price),
+                'Absolute_Max_Deviation_From_Threshold': float(absolute_max - threshold_price),
+                'Mean_Absolute_Deviation_From_Threshold': float(np.abs(threshold_diff).mean()),
+                'RMSE_From_Threshold': float(np.sqrt(np.mean(np.square(threshold_diff)))),
+                'Mean_to_Threshold_Ratio': float(mean_price / threshold_price),
+                'Median_to_Threshold_Ratio': float(median_50th / threshold_price),
+                'Absolute_Min_to_Threshold_Ratio': float(absolute_min / threshold_price),
+                'Absolute_Max_to_Threshold_Ratio': float(absolute_max / threshold_price),
+                'Mean_Overshoot_If_GT_Threshold': mean_overshoot_if_gt,
+                'Max_Overshoot_If_GT_Threshold': max_overshoot_if_gt,
+                'Mean_Shortfall_If_LE_Threshold': mean_shortfall_if_le,
+                'Max_Shortfall_If_LE_Threshold': max_shortfall_if_le,
+                'Threshold_Z_Score_vs_Terminal_Distribution': (
+                    float((threshold_price - mean_price) / std_dev) if std_dev > 0 else np.nan
+                ),
+            }
+        ]
+    )
+    return terminal_stats_df
+
+
+def _render_stats_table(ax, rows, title):
+    """Render a compact two-column stats table on the provided axes."""
+    ax.axis('off')
+    ax.set_title(title, fontsize=12, fontweight='bold', pad=10)
+    table = ax.table(
+        cellText=[[label, value] for label, value in rows],
+        colLabels=['Metric', 'Value'],
+        loc='center',
+        cellLoc='left',
+        colLoc='left',
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1.0, 1.35)
+
+    for (row_idx, _), cell in table.get_celld().items():
+        if row_idx == 0:
+            cell.set_facecolor('#1f4e79')
+            cell.set_text_props(color='white', weight='bold')
+        elif row_idx % 2 == 0:
+            cell.set_facecolor('#f4f7fb')
+
+
+def export_terminal_performance_stats(
+    price_paths: pd.DataFrame,
+    output_path: str,
+    target_date: str = TARGET_DATE,
+    threshold_price: float = TARGET_PRICE_THRESHOLD,
+) -> None:
+    """Export terminal distribution stats to a standalone image dashboard."""
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Exporting terminal performance stats...")
+    terminal_stats_df = build_terminal_performance_stats(
+        price_paths=price_paths,
+        target_date=target_date,
+        threshold_price=threshold_price,
+    )
+    stats = terminal_stats_df.iloc[0]
+
+    left_rows = [
+        ('Target Date', str(stats['Target_Date'])),
+        ('Forecast Horizon', f"{int(stats['Forecast_Horizon_Months'])} months"),
+        ('Simulation Count', f"{int(stats['Simulation_Count'])}"),
+        ('Rent Price', f"${float(stats['Threshold_Price']):,.0f}"),
+        ('Absolute Min', f"${float(stats['Absolute_Min']):,.0f}"),
+        ('Bear (10th)', f"${float(stats['Bear_10th']):,.0f}"),
+        ('Median (50th)', f"${float(stats['Median_50th']):,.0f}"),
+        ('Mean', f"${float(stats['Mean']):,.0f}"),
+        ('Bull (90th)', f"${float(stats['Bull_90th']):,.0f}"),
+        ('Absolute Max', f"${float(stats['Absolute_Max']):,.0f}"),
+    ]
+
+    right_rows = [
+        ('Count > Rent', f"{int(stats['Count_Strictly_GT_Threshold'])}"),
+        ('Share > Rent', f"{float(stats['Share_Strictly_GT_Threshold']) * 100:.2f}%"),
+        ('Count <= Rent', f"{int(stats['Count_At_Or_Below_Threshold'])}"),
+        ('Share <= Rent', f"{float(stats['Share_At_Or_Below_Threshold']) * 100:.2f}%"),
+        ('Mean Deviation', f"${float(stats['Mean_Deviation_From_Threshold']):+,.0f}"),
+        ('Median Deviation', f"${float(stats['Median_Deviation_From_Threshold']):+,.0f}"),
+        ('Min Deviation', f"${float(stats['Absolute_Min_Deviation_From_Threshold']):+,.0f}"),
+        ('Max Deviation', f"${float(stats['Absolute_Max_Deviation_From_Threshold']):+,.0f}"),
+        ('Mean Abs Deviation', f"${float(stats['Mean_Absolute_Deviation_From_Threshold']):,.0f}"),
+        ('RMSE vs Rent', f"${float(stats['RMSE_From_Threshold']):,.0f}"),
+    ]
+
+    fig = plt.figure(figsize=(16, 10))
+    grid = fig.add_gridspec(2, 2, height_ratios=[1.0, 1.2], hspace=0.3, wspace=0.2)
+
+    ax_left = fig.add_subplot(grid[0, 0])
+    ax_right = fig.add_subplot(grid[0, 1])
+    _render_stats_table(ax_left, left_rows, 'Terminal Distribution Snapshot')
+    _render_stats_table(ax_right, right_rows, 'Threshold Analysis')
+
+    ax_levels = fig.add_subplot(grid[1, :])
+    labels = ['Absolute Min', 'Bear 10th', 'Median 50th', 'Mean', 'Bull 90th', 'Absolute Max']
+    values = [
+        float(stats['Absolute_Min']),
+        float(stats['Bear_10th']),
+        float(stats['Median_50th']),
+        float(stats['Mean']),
+        float(stats['Bull_90th']),
+        float(stats['Absolute_Max']),
+    ]
+    colors = ['#d73027', '#fc8d59', '#fee08b', '#91bfdb', '#4575b4', '#313695']
+    ax_levels.barh(labels, values, color=colors, alpha=0.9)
+    ax_levels.axvline(
+        x=float(stats['Threshold_Price']),
+        color='black',
+        linestyle='--',
+        linewidth=2,
+        label=f"Threshold (${float(stats['Threshold_Price']):,.0f})",
+    )
+    ax_levels.set_title('March 2050 Price Levels vs Rent', fontsize=12, fontweight='bold')
+    ax_levels.set_xlabel('Price (CAD)')
+    ax_levels.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"${x/1e6:.2f}M"))
+    ax_levels.grid(True, axis='x', alpha=0.25, linestyle='--')
+    ax_levels.legend(loc='lower right', framealpha=0.95)
+
+    fig.suptitle(
+        'Terminal Forecast Performance Dashboard',
+        fontsize=16,
+        fontweight='bold',
+        y=0.98,
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.965])
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+    count_gt_threshold = int(terminal_stats_df.loc[0, 'Count_Strictly_GT_Threshold'])
+    total_simulations = int(terminal_stats_df.loc[0, 'Simulation_Count'])
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Terminal stats saved to {output_path}")
+    print(
+        f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+        f"March 2050 forecasts strictly > ${threshold_price:,.0f}: {count_gt_threshold}/{total_simulations}\n"
+    )
 
 
 def create_fan_chart(price_paths: pd.DataFrame, summary_stats_df: pd.DataFrame,
@@ -257,6 +465,7 @@ def main():
     paths_output = os.path.join(results_dir, "final_simulations.csv")
     stats_output = os.path.join(results_dir, "final_summary_stats.csv")
     plot_output = os.path.join(results_dir, "final_simulations_plot.png")
+    terminal_stats_output = os.path.join(results_dir, "final_terminal_performance_stats.png")
     
     # Ensure results directory exists
     os.makedirs(results_dir, exist_ok=True)
@@ -273,7 +482,7 @@ def main():
     train_master_model(simulator, df)
     
     # Stage 4: Run Monte Carlo Simulation
-    price_paths = run_monte_carlo_simulation(simulator, steps=300, iterations=20)
+    price_paths = run_monte_carlo_simulation(simulator, steps=300, iterations=100)
     
     # Stage 5: Aggregate Statistics
     summary_stats_df = aggregate_statistics(price_paths)
@@ -283,6 +492,14 @@ def main():
     
     # Stage 7: Export Results
     export_results(price_paths, summary_stats_df, paths_output, stats_output)
+
+    # Stage 8: Export terminal performance stats (March 2050 distribution)
+    export_terminal_performance_stats(
+        price_paths=price_paths,
+        output_path=terminal_stats_output,
+        target_date=TARGET_DATE,
+        threshold_price=TARGET_PRICE_THRESHOLD,
+    )
     
     # === COMPLETION ===
     overall_end = datetime.now()
@@ -296,6 +513,7 @@ def main():
     print(f"  1. Raw Simulations (1,000 paths):  {paths_output}")
     print(f"  2. Summary Statistics (percentiles): {stats_output}")
     print(f"  3. Fan Chart Visualization:         {plot_output}")
+    print(f"  4. Terminal Performance Dashboard:  {terminal_stats_output}")
     print("\nRisk Matrix & Buy vs. Rent Analysis can now proceed with these outputs.")
     print("=" * 80 + "\n")
 
