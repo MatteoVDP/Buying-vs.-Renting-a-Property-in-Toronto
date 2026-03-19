@@ -6,6 +6,9 @@ The project combines macroeconomic simulation, feature-engineered machine learni
 
 Web App: https://buying-vs-renting-a-property-in-tor.vercel.app/
 
+<img width="2736" height="1447" alt="image" src="https://github.com/user-attachments/assets/bb7000fe-014c-4868-ba99-ffc996004f58" />
+
+
 ## Project Goals
 
 - Forecast housing market trajectories over 25 year horizon.
