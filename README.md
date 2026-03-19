@@ -4,6 +4,8 @@ This repository contains a multi-model forecasting system for Toronto detached-h
 
 The project combines macroeconomic simulation, feature-engineered machine learning, Monte Carlo forecasting, and post-processing scripts for diagnostics and stress testing.
 
+Web App: https://buying-vs-renting-a-property-in-tor.vercel.app/
+
 ## Project Goals
 
 - Forecast housing market trajectories over 25 year horizon.
