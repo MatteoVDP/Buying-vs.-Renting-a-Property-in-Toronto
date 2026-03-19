@@ -11,9 +11,11 @@ Methodology:
 - Measure MAPE, RMSE, Directional Accuracy, CAGR Error, and Distribution Coverage
 """
 
+import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.patches import FancyBboxPatch
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 import inspect
@@ -33,6 +35,7 @@ FORECAST_HORIZON = 240  # 20 years = 240 months
 MONTE_CARLO_ITERATIONS = 3  # Number of simulation paths per fold
 RESULTS_DIR = "/workspaces/Buying-vs.-Renting-a-Property-in-Toronto/results"
 DATA_PATH = "/workspaces/Buying-vs.-Renting-a-Property-in-Toronto/data/processed_data.csv"
+AGGREGATE_FACT_SHEET_OUTPUT = f"{RESULTS_DIR}/walk_forward_aggregate_fact_sheet.png"
 
 # Define the 6 validation periods
 VALIDATION_FOLDS = [
@@ -298,18 +301,7 @@ def run_fold_validation(fold_idx, fold_config, df):
     # Distribution coverage
     coverage = calculate_distribution_coverage(actual_prices, all_forecast_paths)
 
-    # Print results
-    print("\n" + "─" * 80)
-    print("PERFORMANCE METRICS")
-    print("─" * 80)
-    print(f"MAPE:                  {mape:.2f}%")
-    print(f"RMSE:                  ${rmse:,.2f}")
-    print(f"Directional Accuracy:  {directional_acc:.2f}%")
-    print(f"Actual CAGR:           {actual_cagr:.2f}%")
-    print(f"Forecast CAGR:         {forecast_cagr:.2f}%")
-    print(f"CAGR Error:            {cagr_error:+.2f}%")
-    print(f"Distribution Coverage: {coverage:.2f}%")
-    print("─" * 80)
+    print("✓ Fold performance metrics computed (used in aggregate fact sheet)")
     print()
 
     # Return all data for aggregation and visualization
@@ -332,6 +324,179 @@ def run_fold_validation(fold_idx, fold_config, df):
             'coverage': coverage
         }
     }
+
+
+def _draw_fact_card(ax, x, y, w, h, title, value, subtitle):
+    """Draw a compact fact card inside a fact-sheet canvas."""
+    card = FancyBboxPatch(
+        (x, y),
+        w,
+        h,
+        boxstyle='round,pad=0.012,rounding_size=0.02',
+        transform=ax.transAxes,
+        facecolor='white',
+        edgecolor='#1f4e79',
+        linewidth=1.8,
+    )
+    ax.add_patch(card)
+    ax.text(x + 0.02, y + h - 0.04, title, transform=ax.transAxes, fontsize=10, fontweight='bold', color='#334e68')
+    ax.text(x + 0.02, y + h * 0.50, value, transform=ax.transAxes, fontsize=17, fontweight='bold', color='#102a43')
+    ax.text(x + 0.02, y + 0.03, subtitle, transform=ax.transAxes, fontsize=9.2, color='#627d98')
+
+
+def export_aggregate_fact_sheet(all_results, output_path):
+    """Export aggregate walk-forward statistics as a visual fact sheet."""
+    if not all_results:
+        raise ValueError('Cannot build aggregate fact sheet from empty results')
+
+    mapes = np.array([r['metrics']['mape'] for r in all_results], dtype=float)
+    rmses = np.array([r['metrics']['rmse'] for r in all_results], dtype=float)
+    directional_accs = np.array([r['metrics']['directional_accuracy'] for r in all_results], dtype=float)
+    cagr_errors = np.array([r['metrics']['cagr_error'] for r in all_results], dtype=float)
+    coverages = np.array([r['metrics']['coverage'] for r in all_results], dtype=float)
+    horizons = np.array([r['actual_horizon'] for r in all_results], dtype=int)
+
+    best_mape = min(all_results, key=lambda r: r['metrics']['mape'])
+    worst_mape = max(all_results, key=lambda r: r['metrics']['mape'])
+    best_coverage = max(all_results, key=lambda r: r['metrics']['coverage'])
+    worst_coverage = min(all_results, key=lambda r: r['metrics']['coverage'])
+
+    fig, ax = plt.subplots(figsize=(16, 10))
+    fig.patch.set_facecolor('#eef3f9')
+    ax.set_facecolor('#eef3f9')
+    ax.axis('off')
+
+    ax.text(
+        0.02,
+        0.965,
+        'Walk-Forward Aggregate Performance Fact Sheet',
+        transform=ax.transAxes,
+        fontsize=20,
+        fontweight='bold',
+        color='#102a43',
+        va='top',
+    )
+    ax.text(
+        0.02,
+        0.925,
+        (
+            f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  |  "
+            f"Valid folds: {len(all_results)}/{len(VALIDATION_FOLDS)}  |  "
+            f"Average horizon: {np.mean(horizons):.1f} months"
+        ),
+        transform=ax.transAxes,
+        fontsize=10,
+        color='#486581',
+    )
+
+    card_w = 0.305
+    card_h = 0.165
+    x_positions = [0.02, 0.347, 0.674]
+    y_top = 0.70
+    y_bottom = 0.50
+
+    cards = [
+        ('Average MAPE', f"{np.mean(mapes):.2f}%", f"Range: {np.min(mapes):.2f}% to {np.max(mapes):.2f}%"),
+        ('Median MAPE', f"{np.median(mapes):.2f}%", f"Std Dev: {np.std(mapes, ddof=0):.2f} pts"),
+        ('Average RMSE', f"${np.mean(rmses):,.0f}", f"Range: ${np.min(rmses):,.0f} to ${np.max(rmses):,.0f}"),
+        (
+            'Average Directional Accuracy',
+            f"{np.mean(directional_accs):.2f}%",
+            f"Range: {np.min(directional_accs):.2f}% to {np.max(directional_accs):.2f}%",
+        ),
+        ('Average Coverage', f"{np.mean(coverages):.2f}%", f"Range: {np.min(coverages):.2f}% to {np.max(coverages):.2f}%"),
+        ('Average CAGR Error', f"{np.mean(cagr_errors):+.2f}%", f"Range: {np.min(cagr_errors):+.2f}% to {np.max(cagr_errors):+.2f}%"),
+    ]
+
+    for idx, (title, value, subtitle) in enumerate(cards[:3]):
+        _draw_fact_card(ax, x_positions[idx], y_top, card_w, card_h, title, value, subtitle)
+    for idx, (title, value, subtitle) in enumerate(cards[3:]):
+        _draw_fact_card(ax, x_positions[idx], y_bottom, card_w, card_h, title, value, subtitle)
+
+    left_panel = FancyBboxPatch(
+        (0.02, 0.12),
+        0.47,
+        0.30,
+        boxstyle='round,pad=0.012,rounding_size=0.02',
+        transform=ax.transAxes,
+        facecolor='white',
+        edgecolor='#829ab1',
+        linewidth=1.4,
+    )
+    right_panel = FancyBboxPatch(
+        (0.51, 0.12),
+        0.47,
+        0.30,
+        boxstyle='round,pad=0.012,rounding_size=0.02',
+        transform=ax.transAxes,
+        facecolor='white',
+        edgecolor='#829ab1',
+        linewidth=1.4,
+    )
+    ax.add_patch(left_panel)
+    ax.add_patch(right_panel)
+
+    ax.text(0.04, 0.395, 'Range Snapshot', transform=ax.transAxes, fontsize=12, fontweight='bold', color='#102a43')
+    ax.text(
+        0.04,
+        0.36,
+        '\n'.join(
+            [
+                f"• MAPE spread: {np.max(mapes) - np.min(mapes):.2f} percentage points",
+                f"• Directional accuracy spread: {np.max(directional_accs) - np.min(directional_accs):.2f} points",
+                f"• Coverage spread: {np.max(coverages) - np.min(coverages):.2f} points",
+                f"• RMSE spread: ${np.max(rmses) - np.min(rmses):,.0f}",
+                f"• CAGR error spread: {np.max(cagr_errors) - np.min(cagr_errors):.2f} points",
+            ]
+        ),
+        transform=ax.transAxes,
+        fontsize=10,
+        color='#334e68',
+        va='top',
+    )
+
+    ax.text(0.53, 0.395, 'Fold Highlights', transform=ax.transAxes, fontsize=12, fontweight='bold', color='#102a43')
+    ax.text(
+        0.53,
+        0.36,
+        '\n'.join(
+            [
+                (
+                    f"• Best MAPE: Fold {best_mape['fold_idx'] + 1} "
+                    f"({best_mape['test_start'][:7]} to {best_mape['test_end'][:7]}) "
+                    f"at {best_mape['metrics']['mape']:.2f}%"
+                ),
+                (
+                    f"• Worst MAPE: Fold {worst_mape['fold_idx'] + 1} "
+                    f"({worst_mape['test_start'][:7]} to {worst_mape['test_end'][:7]}) "
+                    f"at {worst_mape['metrics']['mape']:.2f}%"
+                ),
+                (
+                    f"• Best coverage: Fold {best_coverage['fold_idx'] + 1} "
+                    f"at {best_coverage['metrics']['coverage']:.2f}%"
+                ),
+                (
+                    f"• Lowest coverage: Fold {worst_coverage['fold_idx'] + 1} "
+                    f"at {worst_coverage['metrics']['coverage']:.2f}%"
+                ),
+                (
+                    f"• Current average directional accuracy suggests "
+                    f"{np.mean(directional_accs):.2f}% month-to-month direction match"
+                ),
+            ]
+        ),
+        transform=ax.transAxes,
+        fontsize=10,
+        color='#334e68',
+        va='top',
+    )
+
+    plt.tight_layout(rect=[0, 0, 1, 0.98])
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+    print(f"✓ Aggregate fact sheet saved to: {output_path}")
+    print()
 
 
 def aggregate_results(all_results):
@@ -437,6 +602,8 @@ def main():
     print("=" * 80)
     print()
     
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+
     # Load data
     df = load_data()
     
@@ -445,6 +612,9 @@ def main():
     for idx, fold_config in enumerate(VALIDATION_FOLDS):
         result = run_fold_validation(idx, fold_config, df)
         all_results.append(result)
+
+    # Export aggregate metrics fact sheet
+    export_aggregate_fact_sheet(all_results, AGGREGATE_FACT_SHEET_OUTPUT)
     
     # Aggregate statistics
     aggregate_results(all_results)

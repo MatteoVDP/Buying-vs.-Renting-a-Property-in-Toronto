@@ -17,7 +17,18 @@ PROCESSED_DATA_PATH = os.path.join(ROOT_DIR, "data", "processed_data.csv")
 OUTPUT_PLOT_PATH = os.path.join(ROOT_DIR, "results", "all_model_comp_plot.png")
 
 START_PRICE = 1090320.0
-HIST_LOG_RETURN_START = pd.Timestamp("1995-01-01")
+HISTORICAL_START = pd.Timestamp("1995-03-01")
+HIST_LOG_RETURN_START = HISTORICAL_START
+
+
+def _format_currency(value: float) -> str:
+    """Format currency in a compact, legend-friendly style."""
+    abs_value = abs(float(value))
+    if abs_value >= 1_000_000:
+        return f"${value/1_000_000:.2f}M"
+    if abs_value >= 1_000:
+        return f"${value/1_000:.1f}K"
+    return f"${value:.0f}"
 
 
 def load_simulation_percentiles(simulations_path: str) -> pd.DataFrame:
@@ -72,7 +83,7 @@ def build_avg_log_return_path(
     start_price: float,
     processed_data_path: str,
 ) -> tuple[pd.Series, float]:
-    """Build an exponential path using average monthly log return since 1995."""
+    """Build an exponential path using average monthly log return from HIST_LOG_RETURN_START."""
     history = pd.read_csv(processed_data_path, usecols=["date", "Log_Return_MoM"])
     history["date"] = pd.to_datetime(history["date"])
 
@@ -115,6 +126,7 @@ def build_historical_series(
     historical = pd.Series(prices.to_numpy(), index=history["date"])
     historical = historical.replace([np.inf, -np.inf], np.nan).ffill().bfill()
 
+    historical = historical[historical.index >= HISTORICAL_START]
     historical = historical[historical.index < forecast_start]
     if historical.empty:
         raise ValueError("Historical series is empty after filtering for pre-forecast dates")
@@ -131,27 +143,48 @@ def create_plot(
     output_plot_path: str,
 ) -> None:
     """Create and save a single chart with all requested lines."""
-    fig, ax = plt.subplots(figsize=(16, 9))
+    fig, ax = plt.subplots(figsize=(11, 9))
 
     ax.plot(
         historical_prices.index,
         historical_prices.values,
         color="darkblue",
         linewidth=2.5,
-        label=f"Historical ({historical_prices.index.min().year}-{historical_prices.index.max().year})",
+        label=(
+            f"Historical ({historical_prices.index.min().year}-{historical_prices.index.max().year}), "
+            f"Last = {_format_currency(historical_prices.iloc[-1])}"
+        ),
         zorder=10,
     )
 
-    ax.plot(summary.index, summary["Bear_10th"], color="red", linewidth=2.5, label="Bear (10th %ile)")
-    ax.plot(summary.index, summary["Base_50th"], color="black", linewidth=2.5, label="Base (50th %ile)")
-    ax.plot(summary.index, summary["Bull_90th"], color="green", linewidth=2.5, label="Bull (90th %ile)")
+    ax.plot(
+        summary.index,
+        summary["Bear_10th"],
+        color="red",
+        linewidth=2.5,
+        label=f"Bear (10th %ile), FV = {_format_currency(summary['Bear_10th'].iloc[-1])}",
+    )
+    ax.plot(
+        summary.index,
+        summary["Base_50th"],
+        color="black",
+        linewidth=2.5,
+        label=f"Base (50th %ile), FV = {_format_currency(summary['Base_50th'].iloc[-1])}",
+    )
+    ax.plot(
+        summary.index,
+        summary["Bull_90th"],
+        color="green",
+        linewidth=2.5,
+        label=f"Bull (90th %ile), FV = {_format_currency(summary['Bull_90th'].iloc[-1])}",
+    )
 
     ax.plot(
         summary.index,
         portfolio_path,
         color="darkorange",
         linewidth=2.5,
-        label="Rent Model Portfolio Path",
+        label=f"Rent Model Portfolio Path, FV = {_format_currency(portfolio_path.iloc[-1])}",
     )
 
     ax.plot(
@@ -160,7 +193,10 @@ def create_plot(
         color="navy",
         linewidth=2.5,
         linestyle="--",
-        label=f"Start $1,090,320 @ Avg Log Return Since 1995 ({avg_log_return:.3%}/mo)",
+        label=(
+            f"Average Historical Return ({avg_log_return:.3%}/mo), "
+            f"FV = {_format_currency(avg_log_return_path.iloc[-1])}"
+        ),
     )
 
     forecast_start_marker = historical_prices.index.max()
@@ -176,7 +212,7 @@ def create_plot(
     )
 
     ax.set_title(
-        "Toronto Housing Comparison: Bear/Base/Bull vs Rent Model & Historical Avg Log Return",
+        "Toronto Housing Comparison: Bear/Base/Bull vs Rent Model & Avg Historical Return",
         fontsize=15,
         fontweight="bold",
         pad=16,
@@ -186,9 +222,9 @@ def create_plot(
 
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda value, _: f"${value/1e6:.1f}M"))
     ax.grid(True, alpha=0.3, linestyle="--")
-    ax.legend(loc="upper left", fontsize=10, framealpha=0.95)
+    ax.legend(loc="upper left", fontsize=11, framealpha=0.95)
 
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0, 1, 0.92])
     plt.savefig(output_plot_path, dpi=300, bbox_inches="tight")
     plt.close()
 
@@ -228,7 +264,7 @@ def main() -> None:
     print(
         f"Historical span: {historical_prices.index.min().date()} to {historical_prices.index.max().date()}"
     )
-    print(f"Avg monthly log return since 1995: {avg_log_return:.6f}")
+    print(f"Avg monthly log return since {HIST_LOG_RETURN_START.date()}: {avg_log_return:.6f}")
 
 
 if __name__ == "__main__":
